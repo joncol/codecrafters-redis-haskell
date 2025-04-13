@@ -16,6 +16,7 @@ dependencies:
   - bytestring # useful to send bytes over the network
   - network # required when using bytestring
   - text # use Text rather than String
+  - text-show
   - stm # may help with a concurrent database
   - containers # may help with the database structure and debugging
   - time # may help with the expiry function
@@ -26,6 +27,9 @@ dependencies:
   - parser-combinators
   - parsec
   - attoparsec
+  - pipes
+  - pipes-attoparsec
+  - pipes-network
 
 executables:
   codecrafters-redis-exe:

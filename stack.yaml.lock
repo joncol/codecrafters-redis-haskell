@@ -3,7 +3,14 @@
 # For more information, please see the documentation at:
 #   https://docs.haskellstack.org/en/stable/lock_files
 
-packages: []
+packages:
+- completed:
+    hackage: pipes-network-0.6.5@sha256:1dd16c7dd7f70c0683052c486f4d46d89ff4ae68d0738da2efa451d452fcd657,1776
+    pantry-tree:
+      sha256: 55f2e067a5508c20c7b5755ac21e77a59e315be429da6ba98066a2bd660794da
+      size: 440
+  original:
+    hackage: pipes-network-0.6.5@sha256:1dd16c7dd7f70c0683052c486f4d46d89ff4ae68d0738da2efa451d452fcd657,1776
 snapshots:
 - completed:
     sha256: d133abe75e408a407cce3f032c96ac1bbadf474a93b5156ebf4135b53382d56b
