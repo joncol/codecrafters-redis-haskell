@@ -12,6 +12,7 @@ module Server
 import Control.Concurrent.STM
 import Control.Monad
 import Control.Monad.Reader
+import Data.Attoparsec.ByteString qualified as A
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.Map.Strict qualified as Map
@@ -33,16 +34,8 @@ import RespType
 runServer :: MonadIO m => (Socket, SockAddr) -> Effect (RedisM m) ()
 runServer (socket, addr) = do
   env <- ask
-  void (A.parsed array (fromSocket socket bufferSize))
+  void (A.parsed parseCommand (fromSocket socket bufferSize))
     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
-    >-> P.tee
-      ( P.filter (isPsyncCommand . snd)
-          >-> P.mapM_
-            ( const $ do
-                sendRdbDataToReplica socket
-                saveReplicaConnection (socket, addr) env
-            )
-      )
     >-> ( if env.isMasterNode
             then
               P.tee
@@ -55,9 +48,22 @@ runServer (socket, addr) = do
             else cat
         )
     >-> P.map snd -- throw away the RespType array and only keep the commands
-    >-> P.wither (runCommand (socket, addr))
-    >-> P.map (TE.encodeUtf8 . showt)
-    >-> toSocket socket
+    >-> P.wither (\cmd -> fmap (cmd,) <$> runCommand (socket, addr) cmd)
+    >-> P.tee
+      ( P.map snd -- throw away the commands and only keep the results
+          >-> P.map (TE.encodeUtf8 . showt)
+          >-> toSocket socket
+      )
+    >-> P.filter (isPsyncCommand . fst)
+    >-> P.mapM_
+      ( const $ do
+          -- Note that this needs to happen after the response to the
+          -- PSYNC command has been sent (in `toSocket` above).
+          sendRdbDataToReplica socket
+          saveReplicaConnection (socket, addr) env
+      )
+  where
+    parseCommand = A.choice [psyncResponse, rdbData, array]
 
 sendRdbDataToReplica :: MonadIO m => Socket -> m ()
 sendRdbDataToReplica socket = do

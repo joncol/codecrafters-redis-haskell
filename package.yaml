@@ -30,6 +30,7 @@ dependencies:
   - pipes
   - pipes-attoparsec
   - pipes-network
+  - safe
 
 executables:
   codecrafters-redis-exe:

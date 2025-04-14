@@ -289,7 +289,7 @@ runReplConfCommand (socket, addr) key val
 
 runPsyncCommand :: (MonadIO m) => Text -> Text -> RedisM m RespType
 runPsyncCommand _replicationId _offset = do
-  replId <- fromMaybe "not available for replicas" <$> asks mReplicationId
+  replId <- asks $ fromMaybe "not available for replicas" . mReplicationId
   pure . SimpleString $ T.unwords ["FULLRESYNC", replId, "0"]
 
 runWaitCommand :: (MonadIO m) => Int -> Int -> RedisM m RespType

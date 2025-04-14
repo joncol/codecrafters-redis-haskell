@@ -41,6 +41,7 @@ executable codecrafters-redis-exe
     , pipes
     , pipes-attoparsec
     , pipes-network
+    , safe
     , stm
     , text
     , text-show

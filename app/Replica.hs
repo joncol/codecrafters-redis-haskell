@@ -16,6 +16,7 @@ import Control.Concurrent.MVar
 import Control.Monad
 import Control.Monad.Reader
 import Data.Attoparsec.ByteString
+import Data.Attoparsec.ByteString qualified as A
 import Data.ByteString.Char8 qualified as BS8
 import Data.IORef (modifyIORef')
 import Data.Text qualified as T
@@ -28,7 +29,6 @@ import Pipes.Prelude qualified as P
 import TextShow
 
 import Command
-import Data.Attoparsec.ByteString qualified as A
 import Options
 import RedisEnv
 import RedisM
@@ -140,10 +140,4 @@ runReplica (socket, addr) = do
     >-> P.map (TE.encodeUtf8 . showt)
     >-> toSocket socket
   where
-    parseCommand =
-      ( A.choice
-          [ psyncResponse
-          , rdbData
-          , array
-          ]
-      )
+    parseCommand = A.choice [psyncResponse, rdbData, array]

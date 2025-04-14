@@ -18,6 +18,7 @@ import Data.Attoparsec.ByteString.Char8 (decimal, endOfLine, space)
 import Data.ByteString qualified as BS
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Safe (headMay)
 import Text.Read (readMaybe)
 
 import RespType hiding (crlf)
@@ -86,7 +87,7 @@ replConfAck = do
   -- TODO: This should be possible to write in a cleaner way.
   Array l <- array
   guard $ length l == 3
-  guard $ head l == BulkString "REPLCONF"
+  guard $ headMay l == Just (BulkString "REPLCONF")
   guard $ l !! 1 == BulkString "ACK"
   let mn :: Maybe Int = case l !! 2 of
         BulkString nStr -> readMaybe $ T.unpack nStr
