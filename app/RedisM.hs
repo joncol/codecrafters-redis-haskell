@@ -1,8 +1,12 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE ImportQualifiedPost #-}
-{-# OPTIONS_GHC -Wall #-} 
+{-# OPTIONS_GHC -Wall #-}
 
-module RedisM where
+module RedisM
+  ( RedisM (..)
+  , bufferSize
+  )
+where
 
 import Control.Monad.Reader
 
@@ -20,5 +24,5 @@ newtype RedisM m a = RedisM
     , MonadIO
     )
 
-bufferSize :: (Integral a) => a
+bufferSize :: Integral a => a
 bufferSize = 4096

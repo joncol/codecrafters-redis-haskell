@@ -2,41 +2,70 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
 {-# OPTIONS_GHC -Wall #-}
 
 module Server
   ( runServer
   ) where
 
-import Control.Arrow ((>>>))
 import Control.Concurrent.STM
 import Control.Monad
 import Control.Monad.Reader
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
-import Data.Function ((&))
 import Data.Map.Strict qualified as Map
+import Data.Text.Encoding qualified as TE
 import Data.Word (Word8)
-import Network.Socket (SockAddr, Socket)
 import Network.Socket.ByteString (sendAll)
+import Pipes
+import Pipes.Attoparsec qualified as A
+import Pipes.Network.TCP
+import Pipes.Prelude qualified as P
+import TextShow
 
 import Command
 import RedisEnv
 import RedisM
-import RespType (RespType, crlf)
+import RespParser
+import RespType
 
-runServer :: (MonadIO m) => (Socket, SockAddr) -> RedisM m ()
+runServer :: MonadIO m => (Socket, SockAddr) -> Effect (RedisM m) ()
 runServer (socket, addr) = do
-  pure ()
+  env <- ask
+  void (A.parsed array (fromSocket socket bufferSize))
+    >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
+    >-> P.tee
+      ( P.filter (isPsyncCommand . snd)
+          >-> P.mapM_
+            ( const $ do
+                sendRdbDataToReplica socket
+                saveReplicaConnection (socket, addr) env
+            )
+      )
+    >-> ( if env.isMasterNode
+            then
+              P.tee
+                ( P.filter (isReplicatedCommand . snd)
+                    >-> P.mapM_
+                      ( \(cmdArray, _cmd) ->
+                          propagateCommandToReplicas env cmdArray
+                      )
+                )
+            else cat
+        )
+    >-> P.map snd -- throw away the RespType array and only keep the commands
+    >-> P.wither (runCommand (socket, addr))
+    >-> P.map (TE.encodeUtf8 . showt)
+    >-> toSocket socket
 
-sendRdbDataToReplica :: (MonadIO m) => Socket -> m ()
+sendRdbDataToReplica :: MonadIO m => Socket -> m ()
 sendRdbDataToReplica socket = do
   liftIO $ putStrLn "sending RDB data to replica"
-  let rdbData =
-        BS8.pack ("$" <> show (length emptyRdb) <> crlf) <> BS.pack emptyRdb
-  liftIO $ sendAll socket rdbData
+  let rdb = BS8.pack ("$" <> show (length emptyRdb) <> crlf) <> BS.pack emptyRdb
+  liftIO $ sendAll socket rdb
 
-saveReplicaConnection :: (MonadIO m) => (Socket, SockAddr) -> RedisEnv -> m ()
+saveReplicaConnection :: MonadIO m => (Socket, SockAddr) -> RedisEnv -> m ()
 saveReplicaConnection (socket, addr) redisEnv = do
   liftIO $ do
     putStrLn $ "storing replica connection, socket: " <> show socket
@@ -51,7 +80,7 @@ saveReplicaConnection (socket, addr) redisEnv = do
       writeTVar redisEnv.replicas $
         Map.insert addr replicaInfo replicas
 
-propagateCommandToReplicas :: (MonadIO m) => RedisEnv -> RespType -> m ()
+propagateCommandToReplicas :: MonadIO m => RedisEnv -> RespType -> m ()
 propagateCommandToReplicas redisEnv cmdArray = do
   -- Increase `masterOffset`.
   liftIO . atomically $ do

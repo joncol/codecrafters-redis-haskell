@@ -1,0 +1,149 @@
+{-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PartialTypeSignatures #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
+{-# OPTIONS_GHC -Wall #-}
+
+module Replica (initReplica) where
+
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar
+import Control.Monad
+import Control.Monad.Reader
+import Data.Attoparsec.ByteString
+import Data.ByteString.Char8 qualified as BS8
+import Data.IORef (modifyIORef')
+import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
+import Network.Socket.ByteString (recv, sendAll)
+import Pipes
+import Pipes.Attoparsec qualified as A
+import Pipes.Network.TCP hiding (recv)
+import Pipes.Prelude qualified as P
+import TextShow
+
+import Command
+import Data.Attoparsec.ByteString qualified as A
+import Options
+import RedisEnv
+import RedisM
+import RespParser
+import RespType
+
+-- | This connects to the master node and does the proper handshake process.
+--
+-- It should only be called if we're a replica.
+--
+-- This function creates a client that loops forever, so it needs to run in its
+-- own thread.
+--
+-- The reason for running forever is that the master node needs to be able to
+-- propagate write commands to the replica at an unknown later time, so we need
+-- to keep the socket open.
+initReplica :: RedisEnv -> IO ()
+initReplica redisEnv
+  | Just master <- redisEnv.options.mReplicaOf
+  , [masterHostName, masterPort] <- T.words master = do
+      -- Open a socket to communicate with the master node.
+      handshakeComplete <- newEmptyMVar
+
+      -- Using `forkIO` here, since the socket should be long lived.
+      void . forkIO . connect (T.unpack masterHostName) (T.unpack masterPort) $
+        \(socket, addr) -> do
+          handshake socket redisEnv.options.port
+
+          putMVar handshakeComplete ()
+
+          -- Set up the replica streaming pipeline.
+          void $
+            flip runReaderT redisEnv . runRedisM . runEffect $
+              runReplica (socket, addr)
+
+          putStrLn "closing replica socket"
+
+      -- Wait until handshake is complete.
+      void $ takeMVar handshakeComplete
+  | otherwise = error "invalid `--replicaof` option value"
+
+handshake :: Socket -> ServiceName -> IO ()
+handshake socket listeningPort = do
+  do
+    sendCommand pingCmd
+    expectResponse (SimpleString "PONG")
+
+    sendCommand replConfCmd1
+    expectResponse (SimpleString "OK")
+
+    sendCommand replConfCmd2
+    expectResponse (SimpleString "OK")
+
+    -- We handle the response to the PSYNC call in the replica `streaming`
+    -- pipeline.
+    sendCommand psyncCmd
+  where
+    sendCommand = sendAll socket . BS8.pack . show
+
+    expectResponse :: RespType -> IO ()
+    expectResponse expected = do
+      respMsg <- recv socket bufferSize
+      -- TODO: Better error handling?
+      guard $ parseOnly respType respMsg == Right expected
+
+    pingCmd = Array [BulkString "PING"]
+
+    replConfCmd1 =
+      Array
+        [ BulkString "REPLCONF"
+        , BulkString "listening-port"
+        , BulkString $ T.pack listeningPort
+        ]
+
+    replConfCmd2 =
+      Array
+        [ BulkString "REPLCONF"
+        , BulkString "capa"
+        , BulkString "psync2"
+        ]
+
+    psyncCmd =
+      Array
+        [ BulkString "PSYNC"
+        , BulkString "?"
+        , BulkString "-1"
+        ]
+
+runReplica
+  :: MonadIO m
+  => (Socket, SockAddr)
+  -> Effect (RedisM m) ()
+runReplica (socket, addr) = do
+  void (A.parsed parseCommand (fromSocket socket bufferSize))
+    >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
+    >-> P.chain
+      ( \(cmdArray, _cmd) -> do
+          -- Update replica offset.
+          env <- ask
+          liftIO $
+            modifyIORef'
+              env.replicaOffset
+              (+ length (show cmdArray))
+      )
+    >-> P.map snd -- throw away the RespType array and only keep the commands
+    >-> P.wither (\cmd -> fmap (cmd,) <$> runCommand (socket, addr) cmd)
+    >-> P.filter (isReplConfGetAckCommand . fst)
+    >-> P.map snd
+    >-> P.map (TE.encodeUtf8 . showt)
+    >-> toSocket socket
+  where
+    parseCommand =
+      ( A.choice
+          [ psyncResponse
+          , rdbData
+          , array
+          ]
+      )

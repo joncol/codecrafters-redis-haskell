@@ -18,6 +18,7 @@ executable codecrafters-redis-exe
       RdbParser
       RedisEnv
       RedisM
+      Replica
       RespParser
       RespType
       Server
