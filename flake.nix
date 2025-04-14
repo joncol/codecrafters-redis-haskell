@@ -20,6 +20,7 @@
           hPkgs.fourmolu
           hPkgs.ghc
           hPkgs.haskell-language-server
+          hPkgs.hoogle
           pkgs.codecrafters-cli
           pkgs.netcat-gnu
           pkgs.pkg-config

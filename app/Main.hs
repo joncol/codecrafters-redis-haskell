@@ -1,16 +1,29 @@
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PartialTypeSignatures #-}
 {-# OPTIONS_GHC -Wall -Wno-unused-top-binds #-}
 
-module Main (main) where
+module Main
+  ( main
+  ) where
 
-import Network.Simple.TCP (HostPreference (HostAny), closeSock, serve)
+import Control.Monad.Reader
+import Data.Text.Encoding qualified as TE
 import Pipes
-import Pipes.Network.TCP (fromSocket, toSocket)
-import qualified Pipes.Prelude as P
+import Pipes.Attoparsec qualified as A
+import Pipes.Network.TCP
+import Pipes.Prelude qualified as P
 import System.IO
+import TextShow
 
-import RedisM (bufferSize)
+import Command
+import Options
+import RedisEnv
+import RedisM
+import RespParser
 
 main :: IO ()
 main = do
@@ -18,13 +31,19 @@ main = do
   hSetBuffering stdout NoBuffering
   hSetBuffering stderr NoBuffering
 
-  let port = "6379"
+  redisEnv <- initialEnv
+
+  let port = redisEnv.options.port
   putStrLn $ "Redis server listening on port " ++ port
 
-  serve HostAny port $ \(socket, address) -> do
-    putStrLn $ "successfully connected client: " ++ show address
-    runEffect $
-      fromSocket socket bufferSize
-        >-> P.map (const "+PONG\r\n")
-        >-> toSocket socket
-    closeSock socket
+  serve HostAny port $ \(socket, addr) -> do
+    putStrLn $ "successfully connected client: " ++ show addr
+    flip runReaderT redisEnv . runRedisM . runEffect $ runServer (socket, addr)
+
+runServer :: MonadIO m => (Socket, SockAddr) -> Effect (RedisM m) ()
+runServer (socket, addr) = do
+  void (A.parsed array (fromSocket socket bufferSize))
+    >-> P.mapMaybe commandFromArray
+    >-> P.wither (runCommand (socket, addr))
+    >-> P.map (TE.encodeUtf8 . showt)
+    >-> toSocket socket
