@@ -88,12 +88,14 @@ saveReplicaConnection (socket, addr) redisEnv = do
 
 propagateCommandToReplicas :: MonadIO m => RedisEnv -> RespType -> m ()
 propagateCommandToReplicas redisEnv cmdArray = do
-  -- Increase `masterOffset`.
+  -- Increment `masterOffset`.
   liftIO . atomically $ do
     masterOffset <- readTVar redisEnv.masterOffset
     writeTVar redisEnv.masterOffset $
       masterOffset + length (show cmdArray)
-  liftIO . putStrLn $ "increasing masterOffset by: " <> show (length $ show cmdArray)
+  liftIO . putStrLn $
+    "incrementing masterOffset by: "
+      <> show (length $ show cmdArray)
   mo <- liftIO $ readTVarIO redisEnv.masterOffset
   liftIO . putStrLn $ "new masterOffset: " <> show mo
 

@@ -18,7 +18,7 @@ import Control.Monad.Reader
 import Data.Attoparsec.ByteString
 import Data.Attoparsec.ByteString qualified as A
 import Data.ByteString.Char8 qualified as BS8
-import Data.IORef (modifyIORef')
+import Data.IORef
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Network.Socket.ByteString (recv, sendAll)
@@ -124,20 +124,25 @@ runReplica
 runReplica (socket, addr) = do
   void (A.parsed parseCommand (fromSocket socket bufferSize))
     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
-    >-> P.chain
-      ( \(cmdArray, _cmd) -> do
-          -- Update replica offset.
-          env <- ask
-          liftIO $
-            modifyIORef'
-              env.replicaOffset
-              (+ length (show cmdArray))
+    >-> P.tee
+      ( P.map snd
+          >-> P.wither (\cmd -> fmap (cmd,) <$> runCommand (socket, addr) cmd)
+          >-> P.filter (isReplConfGetAckCommand . fst)
+          >-> P.map snd
+          >-> P.map (TE.encodeUtf8 . showt)
+          >-> toSocket socket
       )
-    >-> P.map snd -- throw away the RespType array and only keep the commands
-    >-> P.wither (\cmd -> fmap (cmd,) <$> runCommand (socket, addr) cmd)
-    >-> P.filter (isReplConfGetAckCommand . fst)
-    >-> P.map snd
-    >-> P.map (TE.encodeUtf8 . showt)
-    >-> toSocket socket
+    >-> P.mapM_
+      ( \(cmdArray, cmd) -> do
+          -- Post-increment replica offset.
+          env <- ask
+          liftIO $ do
+            putStr "post-incrementing replica offset due to command: "
+            print $ show cmd
+          liftIO $ modifyIORef' env.replicaOffset (+ length (show cmdArray))
+          liftIO $ do
+            ro <- readIORef env.replicaOffset
+            putStrLn $ "new replica offset: " <> show ro
+      )
   where
     parseCommand = A.choice [psyncResponse, rdbData, array]

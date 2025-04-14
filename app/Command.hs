@@ -332,12 +332,12 @@ runWaitCommand numReplicas timeout = do
                 <* (readTVar timeouted >>= check)
 
       when (masterOffset > 0) $ do
-        -- Increase `masterOffset`.
+        -- Increment `masterOffset`.
         liftIO . atomically $ do
           mo <- readTVar env.masterOffset
           writeTVar env.masterOffset $ mo + length (show replConfGetAck)
         liftIO . putStr $
-          "increasing masterOffset by: "
+          "incrementing masterOffset by: "
             <> show (length $ show replConfGetAck)
             <> ", due to command: "
         print $ show replConfGetAck
