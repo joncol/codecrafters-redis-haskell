@@ -30,37 +30,37 @@ import RedisEnv
 import RedisM
 import RespParser
 import RespType
+import Network.Socket (getPeerName)
 
 runServer :: MonadIO m => (Socket, SockAddr) -> Effect (RedisM m) ()
 runServer (socket, addr) = do
   env <- ask
   void (A.parsed parseCommand (fromSocket socket bufferSize))
     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
-    >-> ( if env.isMasterNode
-            then
-              P.tee
-                ( P.filter (isReplicatedCommand . snd)
-                    >-> P.mapM_
-                      ( \(cmdArray, _cmd) ->
-                          propagateCommandToReplicas env cmdArray
-                      )
-                )
-            else cat
-        )
-    >-> P.map snd -- throw away the RespType array and only keep the commands
-    >-> P.wither (\cmd -> fmap (cmd,) <$> runCommand (socket, addr) cmd)
+    -- >-> P.map snd -- throw away the RespType array and only keep the commands
+    >-> P.wither
+      ( \(cmdArray, cmd) ->
+          fmap ((cmdArray, cmd),) <$> runCommand (socket, addr) cmd
+      )
     >-> P.tee
       ( P.map snd -- throw away the commands and only keep the results
           >-> P.map (TE.encodeUtf8 . showt)
           >-> toSocket socket
       )
-    >-> P.filter (isPsyncCommand . fst)
+    >-> P.tee
+      ( P.filter (isPsyncCommand . snd . fst)
+          >-> P.mapM_
+            ( const $ do
+                -- Note that this needs to happen after the response to the
+                -- PSYNC command has been sent (in `toSocket` above).
+                sendRdbDataToReplica socket
+                saveReplicaConnection (socket, addr) env
+            )
+      )
+    >-> P.filter (\((_cmdArray, cmd), _res) -> isReplicatedCommand cmd)
     >-> P.mapM_
-      ( const $ do
-          -- Note that this needs to happen after the response to the
-          -- PSYNC command has been sent (in `toSocket` above).
-          sendRdbDataToReplica socket
-          saveReplicaConnection (socket, addr) env
+      ( \((cmdArray, _cmd), _res) ->
+          when env.isMasterNode $ propagateCommandToReplicas env cmdArray
       )
   where
     parseCommand = A.choice [psyncResponse, rdbData, array]
@@ -72,9 +72,11 @@ sendRdbDataToReplica socket = do
   liftIO $ sendAll socket rdb
 
 saveReplicaConnection :: MonadIO m => (Socket, SockAddr) -> RedisEnv -> m ()
-saveReplicaConnection (socket, addr) redisEnv = do
+saveReplicaConnection (socket, _addr) redisEnv = do
   liftIO $ do
     putStrLn $ "storing replica connection, socket: " <> show socket
+    peerName <- getPeerName socket
+    putStrLn $ "peerName: " <> show peerName
     -- TODO: Handle lost replica connections.
     let replicaInfo =
           ReplicaInfo
@@ -84,20 +86,20 @@ saveReplicaConnection (socket, addr) redisEnv = do
     atomically $ do
       replicas <- readTVar redisEnv.replicas
       writeTVar redisEnv.replicas $
-        Map.insert addr replicaInfo replicas
+        Map.insert peerName replicaInfo replicas
 
 propagateCommandToReplicas :: MonadIO m => RedisEnv -> RespType -> m ()
 propagateCommandToReplicas redisEnv cmdArray = do
   -- Increment `masterOffset`.
   liftIO . atomically $ do
     masterOffset <- readTVar redisEnv.masterOffset
-    writeTVar redisEnv.masterOffset $
-      masterOffset + length (show cmdArray)
+    writeTVar redisEnv.masterOffset $ masterOffset + length (show cmdArray)
+
   liftIO . putStrLn $
     "incrementing masterOffset by: "
       <> show (length $ show cmdArray)
-  mo <- liftIO $ readTVarIO redisEnv.masterOffset
-  liftIO . putStrLn $ "new masterOffset: " <> show mo
+  masterOffset <- liftIO $ readTVarIO redisEnv.masterOffset
+  liftIO . putStrLn $ "new masterOffset: " <> show masterOffset
 
   replicas <- liftIO $ readTVarIO redisEnv.replicas
   forM_ replicas $ \replica -> liftIO $ do

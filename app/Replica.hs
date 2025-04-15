@@ -1,7 +1,5 @@
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PartialTypeSignatures #-}
@@ -116,6 +114,39 @@ handshake socket listeningPort = do
         , BulkString "?"
         , BulkString "-1"
         ]
+
+-- runReplica
+--   :: MonadIO m
+--   => (Socket, SockAddr)
+--   -> Effect (RedisM m) ()
+-- runReplica (socket, addr) = do
+--   void (A.parsed parseCommand (fromSocket socket bufferSize))
+--     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
+--     >-> P.tee
+--       ( P.mapM_
+--           ( \(cmdArray, cmd) -> do
+--               -- Pre-increment replica offset.
+--               env <- ask
+--               liftIO $ do
+--                 putStr $
+--                   "pre-incrementing replica offset (by "
+--                     <> show (length (show cmdArray))
+--                     <> ") due to command: "
+--                 print $ show cmd
+--               liftIO $ modifyIORef' env.replicaOffset (+ length (show cmdArray))
+--               liftIO $ do
+--                 ro <- readIORef env.replicaOffset
+--                 putStrLn $ "new replica offset: " <> show ro
+--           )
+--       )
+--     >-> P.map snd -- throw away the RespType array and only keep the commands
+--     >-> P.wither (\cmd -> fmap (cmd,) <$> runCommand (socket, addr) cmd)
+--     >-> P.filter (isReplConfGetAckCommand . fst)
+--     >-> P.map snd
+--     >-> P.map (TE.encodeUtf8 . showt)
+--     >-> toSocket socket
+--   where
+--     parseCommand = A.choice [psyncResponse, rdbData, array]
 
 runReplica
   :: MonadIO m

@@ -1,8 +1,6 @@
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -23,26 +21,27 @@ module Command
 import Control.Applicative ((<|>))
 import Control.Arrow ((>>>))
 import Control.Concurrent.STM
+import Control.Monad
 import Control.Monad.Reader
+import Data.ByteString.Char8 qualified as BS8
 import Data.Function (on)
 import Data.Functor ((<&>))
 import Data.IORef
+import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromJust, fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time.Clock
-import Text.Read (readMaybe)
-
-import Data.ByteString.Char8 qualified as BS8
 import Network.Socket (SockAddr, Socket, getPeerName)
 import Network.Socket.ByteString (sendAll)
+import Text.Read (readMaybe)
+import TextShow
+
 import Options
 import RedisEnv
 import RedisM
 import RespType
-import TextShow
-import Control.Monad
 
 data Command
   = Ping
@@ -69,7 +68,7 @@ isReplConfGetAckCommand _ = False
 isReplicatedCommand :: Command -> Bool
 isReplicatedCommand Ping = False
 isReplicatedCommand (Echo _) = False
-isReplicatedCommand (Set _ _ _) = True
+isReplicatedCommand (Set {}) = True
 isReplicatedCommand (Get _) = False
 isReplicatedCommand (ConfigGet _) = False
 isReplicatedCommand (Keys _) = False
@@ -78,7 +77,7 @@ isReplicatedCommand (ReplConf _ _) = False
 isReplicatedCommand (Psync _ _) = False
 isReplicatedCommand (Wait _ _) = False
 
-data SetOptions = SetOptions
+newtype SetOptions = SetOptions
   { px :: Maybe Int
   }
   deriving (Show)
@@ -126,7 +125,7 @@ setOptionsFromArray (Array (BulkString o : os)) setOptions
 setOptionsFromArray _ setOptions = setOptions
 
 runCommand
-  :: (MonadIO m)
+  :: MonadIO m
   => (Socket, SockAddr)
   -> Command
   -> RedisM m (Maybe RespType)
@@ -149,7 +148,7 @@ runCommand (socket, addr) command = do
     Wait numReplicas timeout ->
       Just <$> runWaitCommand numReplicas timeout
 
-runSetCommand :: (MonadIO m) => Text -> Text -> SetOptions -> RedisM m RespType
+runSetCommand :: MonadIO m => Text -> Text -> SetOptions -> RedisM m RespType
 runSetCommand key val options = do
   mExpirationTime <- case options.px of
     Just px -> do
@@ -171,14 +170,14 @@ runSetCommand key val options = do
         , mExpirationTime
         }
 
-runGetCommand :: (MonadIO m) => Text -> RedisM m RespType
+runGetCommand :: MonadIO m => Text -> RedisM m RespType
 runGetCommand key = do
   expired <- isKeyExpired key
   if expired
     then pure NullBulkString
     else getValue key
 
-getValue :: (MonadIO m) => Text -> RedisM m RespType
+getValue :: MonadIO m => Text -> RedisM m RespType
 getValue key = do
   dataStoreRef <- asks dataStore
   dataStore <- liftIO $ readIORef dataStoreRef
@@ -187,15 +186,17 @@ getValue key = do
       pure $ BulkString value
     Nothing -> pure NullBulkString
 
-runConfigGetCommand :: (MonadIO m) => Text -> RedisM m RespType
+runConfigGetCommand :: MonadIO m => Text -> RedisM m RespType
 runConfigGetCommand configName =
   do
     configVal <-
-      asks (options >>> optionValueByName configName)
-        <&> maybe NullBulkString BulkString
+      asks
+        ( maybe NullBulkString BulkString
+            . (options >>> optionValueByName configName)
+        )
     pure $ Array [BulkString configName, configVal]
 
-runKeysCommand :: (MonadIO m) => Text -> RedisM m RespType
+runKeysCommand :: MonadIO m => Text -> RedisM m RespType
 runKeysCommand _pat = do
   dataStoreRef <- asks dataStore
   dataStore <- liftIO $ readIORef dataStoreRef
@@ -209,7 +210,7 @@ runKeysCommand _pat = do
       )
       (Map.keys dataStore)
 
-isKeyExpired :: (MonadIO m) => Text -> RedisM m Bool
+isKeyExpired :: MonadIO m => Text -> RedisM m Bool
 isKeyExpired key = do
   dataStoreRef <- asks dataStore
   dataStore <- liftIO $ readIORef dataStoreRef
@@ -223,11 +224,11 @@ isKeyExpired key = do
         Nothing -> pure False
     Nothing -> pure False
 
-runInfoCommand :: (MonadIO m) => Text -> RedisM m RespType
+runInfoCommand :: MonadIO m => Text -> RedisM m RespType
 runInfoCommand section
   | section ~= "replication" = do
       options <- asks options
-      replId <- fromMaybe "not available for replicas" <$> asks mReplicationId
+      replId <- asks $ fromMaybe "not available for replicas" . mReplicationId
       pure . BulkString $
         T.unlines
           [ "# Replication"
@@ -244,7 +245,7 @@ runInfoCommand section
         _ -> "role:slave"
 
 runReplConfCommand
-  :: (MonadIO m)
+  :: MonadIO m
   => (Socket, SockAddr)
   -> Text
   -> Text
@@ -255,13 +256,18 @@ runReplConfCommand (socket, addr) key val
   | key ~= "getack" && val == "*" = do
       env <- ask
       replOffset <- liftIO $ readIORef env.replicaOffset
-      pure . Just . Array $
-        map
-          BulkString
-          [ "REPLCONF"
-          , "ACK"
-          , T.pack $ show replOffset
-          ]
+      if env.options.sendAcks
+        then
+          pure . Just . Array $
+            map
+              BulkString
+              [ "REPLCONF"
+              , "ACK"
+              , T.pack $ show replOffset
+              ]
+        else do
+          liftIO $ putStrLn "Not sending ACK"
+          pure Nothing
   | key ~= "ack" = do
       -- Update the last known replica offset.
       let replicaOffset :: Maybe Int = readMaybe $ T.unpack val
@@ -269,10 +275,7 @@ runReplConfCommand (socket, addr) key val
       env <- ask
       liftIO $ do
         peerName <- getPeerName socket
-        putStrLn $ "replicaOffset: " <> show replicaOffset
         putStrLn $ "peerName: " <> show peerName
-        putStrLn $ "socket: " <> show socket
-        putStrLn $ "addr: " <> show addr
         atomically $ do
           repls <- readTVar env.replicas
           writeTVar env.replicas $
@@ -284,55 +287,72 @@ runReplConfCommand (socket, addr) key val
               )
               peerName
               repls
+
+      -- Debug print.
+      replicas <- liftIO $ readTVarIO env.replicas
+      liftIO . putStrLn $
+        "updated replica offsets: "
+          <> show (map lastKnownReplicaOffset $ Map.elems replicas)
+
+      liftIO . putStrLn $ "replicas: " <> show replicas
+
       pure Nothing
   | otherwise = error $ "unknown REPLCONF key: " <> show key
 
-runPsyncCommand :: (MonadIO m) => Text -> Text -> RedisM m RespType
+runPsyncCommand :: MonadIO m => Text -> Text -> RedisM m RespType
 runPsyncCommand _replicationId _offset = do
   replId <- asks $ fromMaybe "not available for replicas" . mReplicationId
   pure . SimpleString $ T.unwords ["FULLRESYNC", replId, "0"]
 
-runWaitCommand :: (MonadIO m) => Int -> Int -> RedisM m RespType
+runWaitCommand :: MonadIO m => Int -> Int -> RedisM m RespType
 runWaitCommand numReplicas timeout = do
+  liftIO $ putStrLn "-> runWaitCommand"
+
   env <- ask
   masterOffset <- liftIO $ readTVarIO env.masterOffset
   liftIO . putStrLn $ "masterOffset: " <> show masterOffset
   initialUpToDateCount <-
     liftIO . atomically $ caughtUpReplicaCount env masterOffset
   liftIO . putStrLn $ "initialUpToDateCount: " <> show initialUpToDateCount
-  if numReplicas <= initialUpToDateCount
-    then do
-      liftIO . putStrLn $ "simple case, returning early, up-to-date-count: " <> show initialUpToDateCount
-      pure $ Integer initialUpToDateCount
-    else liftIO $ do
-      let replConfGetAck = Array $ map BulkString ["REPLCONF", "GETACK", "*"]
-      when (masterOffset > 0) $ do
-        replicas <- readTVarIO env.replicas
-        liftIO . putStrLn $ "replicas: " <> show replicas
-        forM_ replicas $ \replica -> liftIO $ do
+
+  replicas <- liftIO $ readTVarIO env.replicas
+  liftIO . putStrLn $
+    "replica offsets: "
+      <> show (map lastKnownReplicaOffset $ Map.elems replicas)
+
+  if
+    | masterOffset == 0 -> pure . Integer $ length replicas
+    | numReplicas <= initialUpToDateCount -> do
+        liftIO . putStrLn $
+          "simple case, returning early, up-to-date-count: "
+            <> show initialUpToDateCount
+        pure $ Integer initialUpToDateCount
+    | otherwise -> liftIO $ do
+        let replConfGetAck = Array $ map BulkString ["REPLCONF", "GETACK", "*"]
+
+        forM_ replicas $ \replica -> do
           putStr "sending REPLCONF GETACK ("
           print $ show replConfGetAck
           putStrLn $ ") to socket: " <> show replica.socket
 
-          -- Send a REPLCONF GETACK to each replica. The response is handled in
-          -- "Command.runReplConfCommand".
+          -- Send a REPLCONF GETACK to each replica. The response is handled
+          -- in "Command.runReplConfCommand".
           sendAll replica.socket . BS8.pack $ show replConfGetAck
 
-      -- See: https://gist.github.com/vdorr/cfc97e298d34d0a586012cdea0972e37.
-      result <-
-        registerDelay (timeout * 1000) >>= \timeouted ->
-          atomically $
-            ( do
-                n <- caughtUpReplicaCount env masterOffset
-                check $ numReplicas <= n
-                pure $ Integer n
-            )
-              <|> Integer
-                <$> caughtUpReplicaCount env masterOffset
-                <* (readTVar timeouted >>= check)
+        -- See: https://gist.github.com/vdorr/cfc97e298d34d0a586012cdea0972e37.
+        result <-
+          registerDelay (timeout * 1000) >>= \timeouted -> do
+            atomically $
+              ( do
+                  n <- caughtUpReplicaCount env masterOffset
+                  check $ numReplicas <= n
+                  pure $ Integer n
+              )
+                <|> Integer
+                  <$> caughtUpReplicaCount env masterOffset
+                  <* (readTVar timeouted >>= check)
 
-      when (masterOffset > 0) $ do
-        -- Increment `masterOffset`.
+        -- Increment `masterOffset` due to the REPLCONF GETACK just sent.
         liftIO . atomically $ do
           mo <- readTVar env.masterOffset
           writeTVar env.masterOffset $ mo + length (show replConfGetAck)
@@ -344,10 +364,12 @@ runWaitCommand numReplicas timeout = do
         mo <- liftIO $ readTVarIO env.masterOffset
         liftIO . putStrLn $ "new masterOffset: " <> show mo
 
-      pure result
+        pure result
   where
     caughtUpReplicaCount :: RedisEnv -> Int -> STM Int
     caughtUpReplicaCount env masterOffset = do
       replicas <- readTVar env.replicas
       pure . Map.size $
-        Map.filter (\r -> masterOffset <= r.lastKnownReplicaOffset) replicas
+        Map.filter
+          (\r -> masterOffset <= r.lastKnownReplicaOffset)
+          replicas
