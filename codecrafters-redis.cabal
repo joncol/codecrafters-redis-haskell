@@ -22,6 +22,7 @@ executable codecrafters-redis-exe
       RespParser
       RespType
       Server
+      Stream
       Paths_codecrafters_redis
   hs-source-dirs:
       app

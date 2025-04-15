@@ -2,8 +2,10 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedLabels #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
@@ -42,6 +44,7 @@ import Options
 import RedisEnv
 import RedisM
 import RespType
+import Stream
 
 data Command
   = Ping
@@ -55,6 +58,7 @@ data Command
   | Psync Text Text
   | Wait Int Int
   | Type Text
+  | XAdd StreamKey StreamId [(Text, Text)]
   deriving (Show)
   deriving (TextShow) via FromStringShow Command
 
@@ -78,6 +82,7 @@ isReplicatedCommand (ReplConf _ _) = False
 isReplicatedCommand (Psync _ _) = False
 isReplicatedCommand (Wait _ _) = False
 isReplicatedCommand (Type _) = False
+isReplicatedCommand (XAdd {}) = True
 
 newtype SetOptions = SetOptions
   { px :: Maybe Int
@@ -113,9 +118,24 @@ commandFromArray (Array (BulkString cmd : args))
   | cmd ~= "wait"
   , [BulkString numReplicas, BulkString timeout] <- args =
       Just $ Wait (read $ T.unpack numReplicas) (read $ T.unpack timeout)
-  | cmd ~= "type" , [BulkString key] <- args = Just $ Type key
+  | cmd ~= "type", [BulkString key] <- args = Just $ Type key
+  | cmd ~= "xadd"
+  , BulkString key : BulkString streamId : keyVals <- args =
+      Just $ XAdd key streamId (pairs $ getBulkStrings keyVals)
   | otherwise = Nothing
 commandFromArray _ = Nothing
+
+getBulkStrings :: [RespType] -> [Text]
+getBulkStrings = foldMap getBulkString
+  where
+    getBulkString :: RespType -> [Text]
+    getBulkString (BulkString s) = [s]
+    getBulkString _ = []
+
+pairs :: [a] -> [(a, a)]
+pairs [] = []
+pairs [_] = []
+pairs (x : y : rest) = (x, y) : pairs rest
 
 setOptionsFromArray :: RespType -> SetOptions -> SetOptions
 setOptionsFromArray (Array []) setOptions = setOptions
@@ -151,6 +171,7 @@ runCommand (socket, addr) command = do
     Wait numReplicas timeout ->
       Just <$> runWaitCommand numReplicas timeout
     Type key -> Just <$> runTypeCommand key
+    XAdd key streamId keyVals -> Just <$> runXAddCommand key streamId keyVals
 
 runSetCommand :: MonadIO m => Text -> Text -> SetOptions -> RedisM m RespType
 runSetCommand key val options = do
@@ -379,9 +400,26 @@ runWaitCommand numReplicas timeout = do
           replicas
 
 runTypeCommand :: MonadIO m => Text -> RedisM m RespType
-runTypeCommand  key = do
+runTypeCommand key = do
   env <- ask
   dataStore <- liftIO $ readIORef env.dataStore
-  if key `Map.member` dataStore
-    then pure $ SimpleString "string" -- TODO: Support more types.
-    else pure $ SimpleString "none"
+  streams <- liftIO $ readIORef env.streams
+  if
+    | key `Map.member` dataStore -> pure $ SimpleString "string"
+    | key `Map.member` streams -> pure $ SimpleString "stream"
+    | otherwise -> pure $ SimpleString "none"
+
+runXAddCommand
+  :: MonadIO m
+  => StreamKey
+  -> StreamId
+  -> [(Text, Text)]
+  -> RedisM m RespType
+runXAddCommand key streamId entries = do
+  env <- ask
+  let newStream = [Stream {streamId, entries}]
+  liftIO . modifyIORef' env.streams $ Map.insertWith ins key newStream
+  pure $ BulkString streamId
+  where
+    ins :: [Stream] -> [Stream] -> [Stream]
+    ins newStream oldStream = oldStream <> newStream

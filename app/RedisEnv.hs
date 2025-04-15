@@ -26,9 +26,11 @@ import Text.Megaparsec (parseMaybe)
 import DataStore
 import Options
 import RdbParser qualified
+import Stream
 
 data RedisEnv = RedisEnv
   { dataStore :: IORef DataStore
+  , streams :: IORef (Map StreamKey [Stream])
   , options :: Options
   , isMasterNode :: Bool
   , mReplicationId :: Maybe Text
@@ -53,6 +55,7 @@ initialEnv :: IO RedisEnv
 initialEnv = do
   options <- parseOptions
   dataStore <- createDataStore options
+  streams <- newIORef Map.empty
   let isMasterNode = isNothing options.mReplicaOf
   replicas <- newTVarIO Map.empty
   replicaOffset <- newIORef 0
@@ -60,6 +63,7 @@ initialEnv = do
   pure
     RedisEnv
       { dataStore
+      , streams
       , options
       , isMasterNode
       , -- Only set replication ID for master nodes.
