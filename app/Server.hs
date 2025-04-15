@@ -18,6 +18,7 @@ import Data.ByteString.Char8 qualified as BS8
 import Data.Map.Strict qualified as Map
 import Data.Text.Encoding qualified as TE
 import Data.Word (Word8)
+import Network.Socket (getPeerName)
 import Network.Socket.ByteString (sendAll)
 import Pipes
 import Pipes.Attoparsec qualified as A
@@ -30,14 +31,12 @@ import RedisEnv
 import RedisM
 import RespParser
 import RespType
-import Network.Socket (getPeerName)
 
 runServer :: MonadIO m => (Socket, SockAddr) -> Effect (RedisM m) ()
 runServer (socket, addr) = do
   env <- ask
   void (A.parsed parseCommand (fromSocket socket bufferSize))
     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
-    -- >-> P.map snd -- throw away the RespType array and only keep the commands
     >-> P.wither
       ( \(cmdArray, cmd) ->
           fmap ((cmdArray, cmd),) <$> runCommand (socket, addr) cmd
@@ -52,7 +51,8 @@ runServer (socket, addr) = do
           >-> P.mapM_
             ( const $ do
                 -- Note that this needs to happen after the response to the
-                -- PSYNC command has been sent (in `toSocket` above).
+                -- PSYNC command has been sent (in `toSocket` above), otherwise
+                -- the RDB data would be placed before the "+FULLRESYNC" result.
                 sendRdbDataToReplica socket
                 saveReplicaConnection (socket, addr) env
             )

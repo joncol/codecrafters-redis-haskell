@@ -1,6 +1,4 @@
 {-# LANGUAGE BlockArguments #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PartialTypeSignatures #-}
@@ -33,9 +31,9 @@ main = do
   unless redisEnv.isMasterNode $ do
     initReplica redisEnv
 
-  let port = redisEnv.options.port
-  putStrLn $ "Redis server listening on port " ++ port
+  let port' = redisEnv.options.port
+  putStrLn $ "Redis server listening on port " ++ port'
 
-  serve HostAny port $ \(socket, addr) -> do
+  serve HostAny port' $ \(s, addr) -> do
     putStrLn $ "successfully connected client: " ++ show addr
-    flip runReaderT redisEnv . runRedisM . runEffect $ runServer (socket, addr)
+    flip runReaderT redisEnv . runRedisM . runEffect $ runServer (s, addr)

@@ -52,15 +52,15 @@ initReplica redisEnv
 
       -- Using `forkIO` here, since the socket should be long lived.
       void . forkIO . connect (T.unpack masterHostName) (T.unpack masterPort) $
-        \(socket, addr) -> do
-          handshake socket redisEnv.options.port
+        \(s, addr) -> do
+          handshake s redisEnv.options.port
 
           putMVar handshakeComplete ()
 
           -- Set up the replica streaming pipeline.
           void $
             flip runReaderT redisEnv . runRedisM . runEffect $
-              runReplica (socket, addr)
+              runReplica (s, addr)
 
           putStrLn "closing replica socket"
 
@@ -69,7 +69,7 @@ initReplica redisEnv
   | otherwise = error "invalid `--replicaof` option value"
 
 handshake :: Socket -> ServiceName -> IO ()
-handshake socket listeningPort = do
+handshake s listeningPort = do
   do
     sendCommand pingCmd
     expectResponse (SimpleString "PONG")
@@ -84,11 +84,11 @@ handshake socket listeningPort = do
     -- pipeline.
     sendCommand psyncCmd
   where
-    sendCommand = sendAll socket . BS8.pack . show
+    sendCommand = sendAll s . BS8.pack . show
 
     expectResponse :: RespType -> IO ()
     expectResponse expected = do
-      respMsg <- recv socket bufferSize
+      respMsg <- recv s bufferSize
       -- TODO: Better error handling?
       guard $ parseOnly respType respMsg == Right expected
 
@@ -115,53 +115,20 @@ handshake socket listeningPort = do
         , BulkString "-1"
         ]
 
--- runReplica
---   :: MonadIO m
---   => (Socket, SockAddr)
---   -> Effect (RedisM m) ()
--- runReplica (socket, addr) = do
---   void (A.parsed parseCommand (fromSocket socket bufferSize))
---     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
---     >-> P.tee
---       ( P.mapM_
---           ( \(cmdArray, cmd) -> do
---               -- Pre-increment replica offset.
---               env <- ask
---               liftIO $ do
---                 putStr $
---                   "pre-incrementing replica offset (by "
---                     <> show (length (show cmdArray))
---                     <> ") due to command: "
---                 print $ show cmd
---               liftIO $ modifyIORef' env.replicaOffset (+ length (show cmdArray))
---               liftIO $ do
---                 ro <- readIORef env.replicaOffset
---                 putStrLn $ "new replica offset: " <> show ro
---           )
---       )
---     >-> P.map snd -- throw away the RespType array and only keep the commands
---     >-> P.wither (\cmd -> fmap (cmd,) <$> runCommand (socket, addr) cmd)
---     >-> P.filter (isReplConfGetAckCommand . fst)
---     >-> P.map snd
---     >-> P.map (TE.encodeUtf8 . showt)
---     >-> toSocket socket
---   where
---     parseCommand = A.choice [psyncResponse, rdbData, array]
-
 runReplica
   :: MonadIO m
   => (Socket, SockAddr)
   -> Effect (RedisM m) ()
-runReplica (socket, addr) = do
-  void (A.parsed parseCommand (fromSocket socket bufferSize))
+runReplica (s, addr) = do
+  void (A.parsed parseCommand (fromSocket s bufferSize))
     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
     >-> P.tee
       ( P.map snd
-          >-> P.wither (\cmd -> fmap (cmd,) <$> runCommand (socket, addr) cmd)
+          >-> P.wither (\cmd -> fmap (cmd,) <$> runCommand (s, addr) cmd)
           >-> P.filter (isReplConfGetAckCommand . fst)
           >-> P.map snd
           >-> P.map (TE.encodeUtf8 . showt)
-          >-> toSocket socket
+          >-> toSocket s
       )
     >-> P.mapM_
       ( \(cmdArray, cmd) -> do

@@ -16,6 +16,7 @@ import Control.Monad (guard, void)
 import Data.Attoparsec.ByteString
 import Data.Attoparsec.ByteString.Char8 (decimal, endOfLine, space)
 import Data.ByteString qualified as BS
+import Data.Functor (($>))
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Safe (headMay)
@@ -41,7 +42,7 @@ simpleError = do
 integer :: Parser RespType
 integer = do
   void $ string ":"
-  sign <- option 1 (string "+" *> pure 1 <|> string "-" *> pure -1)
+  sign <- option 1 (string "+" $> 1 <|> string "-" $> -1)
   n <- decimal
   endOfLine
   pure . Integer $ sign * n
