@@ -54,6 +54,7 @@ data Command
   | ReplConf Text Text
   | Psync Text Text
   | Wait Int Int
+  | Type Text
   deriving (Show)
   deriving (TextShow) via FromStringShow Command
 
@@ -76,6 +77,7 @@ isReplicatedCommand (Info _) = False
 isReplicatedCommand (ReplConf _ _) = False
 isReplicatedCommand (Psync _ _) = False
 isReplicatedCommand (Wait _ _) = False
+isReplicatedCommand (Type _) = False
 
 newtype SetOptions = SetOptions
   { px :: Maybe Int
@@ -111,6 +113,7 @@ commandFromArray (Array (BulkString cmd : args))
   | cmd ~= "wait"
   , [BulkString numReplicas, BulkString timeout] <- args =
       Just $ Wait (read $ T.unpack numReplicas) (read $ T.unpack timeout)
+  | cmd ~= "type" , [BulkString key] <- args = Just $ Type key
   | otherwise = Nothing
 commandFromArray _ = Nothing
 
@@ -147,6 +150,7 @@ runCommand (socket, addr) command = do
       Just <$> runPsyncCommand replicationId offset
     Wait numReplicas timeout ->
       Just <$> runWaitCommand numReplicas timeout
+    Type key -> Just <$> runTypeCommand key
 
 runSetCommand :: MonadIO m => Text -> Text -> SetOptions -> RedisM m RespType
 runSetCommand key val options = do
@@ -373,3 +377,11 @@ runWaitCommand numReplicas timeout = do
         Map.filter
           (\r -> masterOffset <= r.lastKnownReplicaOffset)
           replicas
+
+runTypeCommand :: MonadIO m => Text -> RedisM m RespType
+runTypeCommand  key = do
+  env <- ask
+  dataStore <- liftIO $ readIORef env.dataStore
+  if key `Map.member` dataStore
+    then pure $ SimpleString "string" -- TODO: Support more types.
+    else pure $ SimpleString "none"
