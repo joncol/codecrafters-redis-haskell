@@ -18,6 +18,7 @@ import Data.IORef
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isNothing)
+import Data.Sequence (Seq)
 import Data.Text (Text)
 import Network.Socket (SockAddr, Socket)
 import System.IO.Error
@@ -30,7 +31,7 @@ import Stream
 
 data RedisEnv = RedisEnv
   { dataStore :: IORef DataStore
-  , streams :: IORef (Map StreamKey [Stream])
+  , streams :: IORef (Map StreamKey (Seq Stream))
   , options :: Options
   , isMasterNode :: Bool
   , mReplicationId :: Maybe Text

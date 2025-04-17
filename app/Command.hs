@@ -32,6 +32,8 @@ import Data.IORef
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromJust, fromMaybe)
+import Data.Sequence (Seq ((:|>)))
+import Data.Sequence qualified as Seq
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time.Clock
@@ -416,10 +418,30 @@ runXAddCommand
   -> [(Text, Text)]
   -> RedisM m RespType
 runXAddCommand key streamId entries = do
-  env <- ask
-  let newStream = [Stream {streamId, entries}]
-  liftIO . modifyIORef' env.streams $ Map.insertWith ins key newStream
-  pure $ BulkString streamId
+  if streamId == "0-0"
+    then
+      pure $
+        SimpleError
+          "ERR The ID specified in XADD must be greater \
+          \than 0-0"
+    else do
+      env <- ask
+      streams <- liftIO $ readIORef env.streams
+      let mOldStream = Map.lookup key streams
+      case mOldStream of
+        Just oldStream@(_ :|> lastStream)
+          | streamId <= lastStream.streamId ->
+              pure $
+                SimpleError
+                  "ERR The ID specified in XADD is equal or \
+                  \smaller than the target stream top item"
+        _ ->
+          do
+            let newStream = Seq.singleton $ Stream {streamId, entries}
+            liftIO . modifyIORef' env.streams $
+              Map.insertWith ins key newStream
+            pure $ BulkString streamId
   where
-    ins :: [Stream] -> [Stream] -> [Stream]
+    ins :: Seq Stream -> Seq Stream -> Seq Stream
+    ins newStream Seq.Empty = error "unreachable"
     ins newStream oldStream = oldStream <> newStream
