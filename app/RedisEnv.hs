@@ -31,7 +31,7 @@ import Stream
 
 data RedisEnv = RedisEnv
   { dataStore :: IORef DataStore
-  , streams :: IORef (Map StreamKey (Seq Stream))
+  , streams :: TVar (Map StreamKey (Seq Stream))
   , options :: Options
   , isMasterNode :: Bool
   , mReplicationId :: Maybe Text
@@ -56,7 +56,7 @@ initialEnv :: IO RedisEnv
 initialEnv = do
   options <- parseOptions
   dataStore <- createDataStore options
-  streams <- newIORef Map.empty
+  streams <- newTVarIO Map.empty
   let isMasterNode = isNothing options.mReplicaOf
   replicas <- newTVarIO Map.empty
   replicaOffset <- newIORef 0

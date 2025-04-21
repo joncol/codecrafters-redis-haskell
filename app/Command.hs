@@ -109,6 +109,7 @@ defaultSetOptions = SetOptions {px = Nothing}
 data XReadOptions = XReadOptions
   { streamKeys :: [StreamKey]
   , streamIdBounds :: [StreamId]
+  , blockTimeout :: Maybe Int
   }
   deriving (Show)
 
@@ -117,6 +118,7 @@ defaultXReadOptions =
   XReadOptions
     { streamKeys = []
     , streamIdBounds = []
+    , blockTimeout = Nothing
     }
 
 commandFromArray :: RespType -> Maybe Command
@@ -186,13 +188,17 @@ xReadOptionsFromList
   -> XReadOptions
   -> Either RespType XReadOptions
 xReadOptionsFromList [] options = pure options
-xReadOptionsFromList (BulkString o : os) _options
+xReadOptionsFromList (BulkString o : os) options
+  | o ~= "block"
+  , BulkString blockTimeout : os' <- os =
+      xReadOptionsFromList os' $
+        options {blockTimeout = Just . read $ T.unpack blockTimeout}
   | o ~= "streams"
   , even (length os) =
       let (h1, h2) =
             getBulkStrings *** getBulkStrings $ splitAt (length os `div` 2) os
       in  pure
-            XReadOptions
+            options
               { streamKeys = h1
               , streamIdBounds =
                   rights $
@@ -446,13 +452,6 @@ runWaitCommand numReplicas timeout = do
         liftIO . atomically $ do
           mo <- readTVar env.masterOffset
           writeTVar env.masterOffset $ mo + length (show replConfGetAck)
-        liftIO . putStr $
-          "incrementing masterOffset by: "
-            <> show (length $ show replConfGetAck)
-            <> ", due to command: "
-        print $ show replConfGetAck
-        mo <- liftIO $ readTVarIO env.masterOffset
-        liftIO . putStrLn $ "new masterOffset: " <> show mo
 
         pure result
   where
@@ -468,7 +467,7 @@ runTypeCommand :: MonadIO m => Text -> RedisM m RespType
 runTypeCommand key = do
   env <- ask
   dataStore <- liftIO $ readIORef env.dataStore
-  allStreams <- liftIO $ readIORef env.streams
+  allStreams <- liftIO $ readTVarIO env.streams
   if
     | key `Map.member` dataStore -> pure $ SimpleString "string"
     | key `Map.member` allStreams -> pure $ SimpleString "stream"
@@ -482,7 +481,7 @@ runXAddCommand
   -> RedisM m RespType
 runXAddCommand key streamIdReq entries = do
   env <- ask
-  allStreams <- liftIO $ readIORef env.streams
+  allStreams <- liftIO $ readTVarIO env.streams
   let mOldStream = Map.lookup key allStreams
   case streamIdReq of
     Explicit streamId@(StreamId {timePart, sequenceNumber}) ->
@@ -498,7 +497,8 @@ runXAddCommand key streamIdReq entries = do
                       { streamId = streamId
                       , entries
                       }
-            liftIO . modifyIORef' env.streams $ Map.insertWith ins key newStream
+            liftIO . atomically . modifyTVar' env.streams $
+              Map.insertWith ins key newStream
             pure . BulkString $ showt streamId
     TimePart timePart -> do
       addEntry env.streams mOldStream timePart
@@ -517,7 +517,7 @@ runXAddCommand key streamIdReq entries = do
 
     addEntry
       :: MonadIO m
-      => IORef (Map StreamKey (Seq Stream))
+      => TVar (Map StreamKey (Seq Stream))
       -> Maybe (Seq Stream)
       -> Int
       -> RedisM m RespType
@@ -538,7 +538,8 @@ runXAddCommand key streamIdReq entries = do
                     { streamId = streamId
                     , entries
                     }
-          liftIO . modifyIORef' streams $ Map.insertWith ins key newStream
+          liftIO . atomically . modifyTVar' streams $
+            Map.insertWith ins key newStream
           pure . BulkString $ showt streamId
         _ -> do
           let streamId =
@@ -552,7 +553,8 @@ runXAddCommand key streamIdReq entries = do
                     { streamId = streamId
                     , entries
                     }
-          liftIO . modifyIORef' streams $ Map.insertWith ins key newStream
+          liftIO . atomically . modifyTVar' streams $
+            Map.insertWith ins key newStream
           pure . BulkString $ showt streamId
 
     ins :: Seq Stream -> Seq Stream -> Seq Stream
@@ -566,7 +568,7 @@ runXRangeCommand
   -> RedisM m RespType
 runXRangeCommand key (start, end) = do
   env <- ask
-  allStreams <- liftIO $ readIORef env.streams
+  allStreams <- liftIO $ readTVarIO env.streams
   case Map.lookup key allStreams of
     Just strs ->
       pure
@@ -578,18 +580,31 @@ runXRangeCommand key (start, end) = do
     Nothing -> pure $ Array []
 
 runXReadCommand :: MonadIO m => XReadOptions -> RedisM m RespType
-runXReadCommand options = do
-  env <- ask
-  allStreams <- liftIO $ readIORef env.streams
-  let result = Array
-        . flip map (options.streamKeys `zip` options.streamIdBounds)
-        $ \(streamKey, start) -> do
-          case Map.lookup streamKey allStreams of
-            Just strs -> do
-              let streamArrays =
-                    [ Array . map streamToArray . toList $
-                        Seq.dropWhileL (\s -> s.streamId <= start) strs
-                    ]
-              Array $ BulkString streamKey : streamArrays
-            Nothing -> Array []
-  pure result
+runXReadCommand options
+  | Nothing <- options.blockTimeout = liftIO . atomically . getResult =<< ask
+  | Just blockTimeout <- options.blockTimeout = do
+      env <- ask
+      -- See: https://gist.github.com/vdorr/cfc97e298d34d0a586012cdea0972e37.
+      liftIO $
+        registerDelay (blockTimeout * 1000) >>= \timeouted -> do
+          atomically $ getResult env <* (readTVar timeouted >>= check)
+  where
+    getResult :: RedisEnv -> STM RespType
+    getResult env = do
+      allStreams <- readTVar env.streams
+      let result = Array
+            . flip map (options.streamKeys `zip` options.streamIdBounds)
+            $ \(streamKey, start) -> do
+              case Map.lookup streamKey allStreams of
+                Just strs -> do
+                  let strs' = Seq.dropWhileL (\s -> s.streamId <= start) strs
+                  if Seq.null strs'
+                    then NullBulkString
+                    else
+                      let streamArrays =
+                            [ Array . map streamToArray $
+                                toList strs'
+                            ]
+                      in  Array $ BulkString streamKey : streamArrays
+                Nothing -> Array []
+      pure result

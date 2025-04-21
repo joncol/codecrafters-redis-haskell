@@ -3,3 +3,4 @@
 hs-redis-clone.cabal
 *~
 .direnv/
+*.rdb

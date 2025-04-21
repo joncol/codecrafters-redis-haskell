@@ -95,12 +95,6 @@ propagateCommandToReplicas redisEnv cmdArray = do
     masterOffset <- readTVar redisEnv.masterOffset
     writeTVar redisEnv.masterOffset $ masterOffset + length (show cmdArray)
 
-  liftIO . putStrLn $
-    "incrementing masterOffset by: "
-      <> show (length $ show cmdArray)
-  masterOffset <- liftIO $ readTVarIO redisEnv.masterOffset
-  liftIO . putStrLn $ "new masterOffset: " <> show masterOffset
-
   replicas <- liftIO $ readTVarIO redisEnv.replicas
   forM_ replicas $ \replica -> liftIO $ do
     putStr "sending replicated command ("

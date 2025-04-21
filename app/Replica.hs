@@ -131,16 +131,10 @@ runReplica (s, addr) = do
           >-> toSocket s
       )
     >-> P.mapM_
-      ( \(cmdArray, cmd) -> do
+      ( \(cmdArray, _cmd) -> do
           -- Post-increment replica offset.
           env <- ask
-          liftIO $ do
-            putStr "post-incrementing replica offset due to command: "
-            print $ show cmd
           liftIO $ modifyIORef' env.replicaOffset (+ length (show cmdArray))
-          liftIO $ do
-            ro <- readIORef env.replicaOffset
-            putStrLn $ "new replica offset: " <> show ro
       )
   where
     parseCommand = A.choice [psyncResponse, rdbData, array]
