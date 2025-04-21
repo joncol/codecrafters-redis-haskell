@@ -1,6 +1,7 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# OPTIONS_GHC -Wall #-}
@@ -11,6 +12,8 @@ module Stream
   , StreamIdRequest (..)
   , StreamId (..)
   , streamIdRequestParser
+  , streamIdBoundParser
+  , streamToArray
   ) where
 
 import Control.Applicative ((<|>))
@@ -19,7 +22,10 @@ import Data.Attoparsec.ByteString
 import Data.Attoparsec.ByteString.Char8 (decimal)
 import Data.Functor (($>))
 import Data.Text (Text)
+import Data.Word (Word64)
 import TextShow
+
+import RespType
 
 data Stream = Stream
   { streamId :: StreamId
@@ -35,7 +41,7 @@ data StreamIdRequest = Explicit StreamId | TimePart Int | Implicit
 
 data StreamId = StreamId
   { timePart :: Int
-  , sequenceNumber :: Int
+  , sequenceNumber :: Word64
   }
   deriving (Eq, Ord)
   deriving (TextShow) via FromStringShow StreamId
@@ -55,3 +61,25 @@ streamIdRequestParser =
       void $ string "-"
       sequenceNumber <- decimal
       pure $ Explicit StreamId {..}
+
+streamIdBoundParser :: Word64 -> Parser StreamId
+streamIdBoundParser def = do
+  timePart <- decimal
+  sequenceNumber <- option def $ do
+    void $ string "-"
+    decimal
+  pure $ StreamId {..}
+
+streamToArray :: Stream -> RespType
+streamToArray str =
+  Array
+    [ BulkString (showt str.streamId)
+    , entriesToArray str.entries
+    ]
+  where
+    entriesToArray :: [(Text, Text)] -> RespType
+    entriesToArray entries =
+      Array $
+        concatMap
+          (\(k, v) -> [BulkString k, BulkString v])
+          entries

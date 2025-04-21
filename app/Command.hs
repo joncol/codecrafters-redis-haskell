@@ -2,7 +2,6 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE OverloadedLabels #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PartialTypeSignatures #-}
@@ -28,8 +27,10 @@ import Control.Monad
 import Control.Monad.Reader
 import Data.Attoparsec.ByteString (parseOnly)
 import Data.ByteString.Char8 qualified as BS8
+import Data.Foldable (toList)
 import Data.Function (on)
 import Data.IORef
+import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromJust, fromMaybe)
 import Data.Sequence (Seq ((:|>)))
@@ -44,7 +45,6 @@ import Network.Socket.ByteString (sendAll)
 import Text.Read (readMaybe)
 import TextShow
 
-import Data.Map.Strict (Map)
 import Options
 import RedisEnv
 import RedisM
@@ -64,6 +64,7 @@ data Command
   | Wait Int Int
   | Type Text
   | XAdd StreamKey StreamIdRequest [(Text, Text)]
+  | XRange StreamKey (StreamId, StreamId)
   deriving (Show)
   deriving (TextShow) via FromStringShow Command
 
@@ -88,6 +89,7 @@ isReplicatedCommand (Psync _ _) = False
 isReplicatedCommand (Wait _ _) = False
 isReplicatedCommand (Type _) = False
 isReplicatedCommand (XAdd {}) = True
+isReplicatedCommand (XRange {}) = False
 
 newtype SetOptions = SetOptions
   { px :: Maybe Int
@@ -125,10 +127,18 @@ commandFromArray (Array (BulkString cmd : args))
       Just $ Wait (read $ T.unpack numReplicas) (read $ T.unpack timeout)
   | cmd ~= "type", [BulkString key] <- args = Just $ Type key
   | cmd ~= "xadd"
-  , BulkString key : BulkString streamIdStr : keyVals <- args = do
+  , BulkString key : BulkString streamIdStr : keyVals <- args =
       case parseOnly streamIdRequestParser $ TE.encodeUtf8 streamIdStr of
         Left err -> error $ "could not parse request stream ID: " <> err
-        Right streamIdReq -> Just $ XAdd key streamIdReq (pairs $ getBulkStrings keyVals)
+        Right streamIdReq ->
+          Just $ XAdd key streamIdReq (pairs $ getBulkStrings keyVals)
+  | cmd ~= "xrange"
+  , [BulkString key, BulkString start, BulkString end] <- args =
+      case ( parseOnly (streamIdBoundParser 0) $ TE.encodeUtf8 start
+           , parseOnly (streamIdBoundParser maxBound) $ TE.encodeUtf8 end
+           ) of
+        (Right start', Right end') -> Just $ XRange key (start', end')
+        _ -> error "could not parse stream ID bounds"
   | otherwise = Nothing
 commandFromArray _ = Nothing
 
@@ -180,6 +190,8 @@ runCommand (socket, addr) command = do
     Type key -> Just <$> runTypeCommand key
     XAdd key streamIdReq keyVals ->
       Just <$> runXAddCommand key streamIdReq keyVals
+    XRange key (start, end) ->
+      Just <$> runXRangeCommand key (start, end)
 
 runSetCommand :: MonadIO m => Text -> Text -> SetOptions -> RedisM m RespType
 runSetCommand key val options = do
@@ -501,3 +513,22 @@ runXAddCommand key streamIdReq entries = do
     ins :: Seq Stream -> Seq Stream -> Seq Stream
     ins _ Seq.Empty = error "should be unreachable"
     ins newStream oldStream = oldStream <> newStream
+
+runXRangeCommand
+  :: MonadIO m
+  => StreamKey
+  -> (StreamId, StreamId)
+  -> RedisM m RespType
+runXRangeCommand key (start, end) = do
+  env <- ask
+  streams :: Map StreamKey (Seq Stream) <- liftIO $ readIORef env.streams
+  let mStreams :: Maybe (Seq Stream) = Map.lookup key streams
+  case mStreams of
+    Nothing -> pure $ Array []
+    Just (strs :: Seq Stream) -> do
+      pure
+        . Array
+        . map streamToArray
+        . toList
+        . Seq.dropWhileL (\(s :: Stream) -> s.streamId < start)
+        $ Seq.dropWhileR (\(s :: Stream) -> end < s.streamId) strs
