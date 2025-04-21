@@ -8,6 +8,7 @@
 {-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# OPTIONS_GHC -Wall #-}
 
 module Command
   ( Command (..)
@@ -25,17 +26,17 @@ import Control.Arrow ((>>>))
 import Control.Concurrent.STM
 import Control.Monad
 import Control.Monad.Reader
+import Data.Attoparsec.ByteString (parseOnly)
 import Data.ByteString.Char8 qualified as BS8
 import Data.Function (on)
-import Data.Functor ((<&>))
 import Data.IORef
-import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromJust, fromMaybe)
 import Data.Sequence (Seq ((:|>)))
 import Data.Sequence qualified as Seq
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Time.Clock
 import Network.Socket (SockAddr, Socket, getPeerName)
 import Network.Socket.ByteString (sendAll)
@@ -60,7 +61,7 @@ data Command
   | Psync Text Text
   | Wait Int Int
   | Type Text
-  | XAdd StreamKey StreamId [(Text, Text)]
+  | XAdd StreamKey StreamIdRequest [(Text, Text)]
   deriving (Show)
   deriving (TextShow) via FromStringShow Command
 
@@ -122,8 +123,10 @@ commandFromArray (Array (BulkString cmd : args))
       Just $ Wait (read $ T.unpack numReplicas) (read $ T.unpack timeout)
   | cmd ~= "type", [BulkString key] <- args = Just $ Type key
   | cmd ~= "xadd"
-  , BulkString key : BulkString streamId : keyVals <- args =
-      Just $ XAdd key streamId (pairs $ getBulkStrings keyVals)
+  , BulkString key : BulkString streamIdStr : keyVals <- args = do
+      case parseOnly streamIdRequestParser $ TE.encodeUtf8 streamIdStr of
+        Left err -> error $ "could not parse request stream ID: " <> err
+        Right streamIdReq -> Just $ XAdd key streamIdReq (pairs $ getBulkStrings keyVals)
   | otherwise = Nothing
 commandFromArray _ = Nothing
 
@@ -173,7 +176,8 @@ runCommand (socket, addr) command = do
     Wait numReplicas timeout ->
       Just <$> runWaitCommand numReplicas timeout
     Type key -> Just <$> runTypeCommand key
-    XAdd key streamId keyVals -> Just <$> runXAddCommand key streamId keyVals
+    XAdd key streamIdReq keyVals ->
+      Just <$> runXAddCommand key streamIdReq keyVals
 
 runSetCommand :: MonadIO m => Text -> Text -> SetOptions -> RedisM m RespType
 runSetCommand key val options = do
@@ -277,7 +281,7 @@ runReplConfCommand
   -> Text
   -> Text
   -> RedisM m (Maybe RespType)
-runReplConfCommand (socket, addr) key val
+runReplConfCommand (socket, _addr) key val
   | key ~= "listening-port" = pure . Just $ ok
   | key ~= "capa" = pure . Just $ ok
   | key ~= "getack" && val == "*" = do
@@ -414,34 +418,72 @@ runTypeCommand key = do
 runXAddCommand
   :: MonadIO m
   => StreamKey
-  -> StreamId
+  -> StreamIdRequest
   -> [(Text, Text)]
   -> RedisM m RespType
-runXAddCommand key streamId entries = do
-  if streamId == "0-0"
-    then
-      pure $
-        SimpleError
-          "ERR The ID specified in XADD must be greater \
-          \than 0-0"
-    else do
-      env <- ask
-      streams <- liftIO $ readIORef env.streams
-      let mOldStream = Map.lookup key streams
-      case mOldStream of
-        Just oldStream@(_ :|> lastStream)
-          | streamId <= lastStream.streamId ->
-              pure $
-                SimpleError
-                  "ERR The ID specified in XADD is equal or \
-                  \smaller than the target stream top item"
-        _ ->
-          do
-            let newStream = Seq.singleton $ Stream {streamId, entries}
-            liftIO . modifyIORef' env.streams $
-              Map.insertWith ins key newStream
-            pure $ BulkString streamId
+runXAddCommand key streamIdReq entries = do
+  env <- ask
+  streams <- liftIO $ readIORef env.streams
+  let mOldStream = Map.lookup key streams
+  case streamIdReq of
+    Explicit streamId@(StreamId {timePart, sequenceNumber}) ->
+      if timePart == 0 && sequenceNumber == 0
+        then pure idMustBeGreaterThanZeroError
+        else case mOldStream of
+          Just (_ :|> lastStream)
+            | streamId <= lastStream.streamId -> pure idTooSmallError
+          _ -> do
+            let newStream =
+                  Seq.singleton $
+                    Stream
+                      { streamId = streamId
+                      , entries
+                      }
+            liftIO . modifyIORef' env.streams $ Map.insertWith ins key newStream
+            pure . BulkString $ showt streamId
+    TimePart timePart -> do
+      let mOldStream' =
+            Seq.filter (\str -> str.streamId.timePart == timePart)
+              <$> mOldStream
+      case mOldStream' of
+        Just (_ :|> lastStream) -> do
+          let streamId =
+                StreamId
+                  { timePart
+                  , sequenceNumber = lastStream.streamId.sequenceNumber + 1
+                  }
+          let newStream =
+                Seq.singleton $
+                  Stream
+                    { streamId = streamId
+                    , entries
+                    }
+          liftIO . modifyIORef' env.streams $ Map.insertWith ins key newStream
+          pure . BulkString $ showt streamId
+        _ -> do
+          let streamId =
+                StreamId
+                  { timePart
+                  , sequenceNumber = if timePart == 0 then 1 else 0
+                  }
+          let newStream =
+                Seq.singleton $
+                  Stream
+                    { streamId = streamId
+                    , entries
+                    }
+          liftIO . modifyIORef' env.streams $ Map.insertWith ins key newStream
+          pure . BulkString $ showt streamId
+    Implicit -> error "not implemented"
   where
+    idMustBeGreaterThanZeroError =
+      SimpleError "ERR The ID specified in XADD must be greater than 0-0"
+
+    idTooSmallError =
+      SimpleError
+        "ERR The ID specified in XADD is equal or smaller than the \
+        \target stream top item"
+
     ins :: Seq Stream -> Seq Stream -> Seq Stream
-    ins newStream Seq.Empty = error "unreachable"
+    ins _ Seq.Empty = error "should be unreachable"
     ins newStream oldStream = oldStream <> newStream
