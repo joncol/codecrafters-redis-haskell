@@ -38,11 +38,13 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time.Clock
+import Data.Time.Clock.POSIX
 import Network.Socket (SockAddr, Socket, getPeerName)
 import Network.Socket.ByteString (sendAll)
 import Text.Read (readMaybe)
 import TextShow
 
+import Data.Map.Strict (Map)
 import Options
 import RedisEnv
 import RedisM
@@ -442,6 +444,27 @@ runXAddCommand key streamIdReq entries = do
             liftIO . modifyIORef' env.streams $ Map.insertWith ins key newStream
             pure . BulkString $ showt streamId
     TimePart timePart -> do
+      addEntry env.streams mOldStream timePart
+    Implicit -> do
+      t <- liftIO getPOSIXTime
+      let timePart = floor $ nominalDiffTimeToSeconds t * 1000
+      addEntry env.streams mOldStream timePart
+  where
+    idMustBeGreaterThanZeroError =
+      SimpleError "ERR The ID specified in XADD must be greater than 0-0"
+
+    idTooSmallError =
+      SimpleError
+        "ERR The ID specified in XADD is equal or smaller than the \
+        \target stream top item"
+
+    addEntry
+      :: MonadIO m
+      => IORef (Map StreamKey (Seq Stream))
+      -> Maybe (Seq Stream)
+      -> Int
+      -> RedisM m RespType
+    addEntry streams mOldStream timePart = do
       let mOldStream' =
             Seq.filter (\str -> str.streamId.timePart == timePart)
               <$> mOldStream
@@ -458,7 +481,7 @@ runXAddCommand key streamIdReq entries = do
                     { streamId = streamId
                     , entries
                     }
-          liftIO . modifyIORef' env.streams $ Map.insertWith ins key newStream
+          liftIO . modifyIORef' streams $ Map.insertWith ins key newStream
           pure . BulkString $ showt streamId
         _ -> do
           let streamId =
@@ -472,17 +495,8 @@ runXAddCommand key streamIdReq entries = do
                     { streamId = streamId
                     , entries
                     }
-          liftIO . modifyIORef' env.streams $ Map.insertWith ins key newStream
+          liftIO . modifyIORef' streams $ Map.insertWith ins key newStream
           pure . BulkString $ showt streamId
-    Implicit -> error "not implemented"
-  where
-    idMustBeGreaterThanZeroError =
-      SimpleError "ERR The ID specified in XADD must be greater than 0-0"
-
-    idTooSmallError =
-      SimpleError
-        "ERR The ID specified in XADD is equal or smaller than the \
-        \target stream top item"
 
     ins :: Seq Stream -> Seq Stream -> Seq Stream
     ins _ Seq.Empty = error "should be unreachable"
