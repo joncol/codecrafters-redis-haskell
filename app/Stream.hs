@@ -43,7 +43,7 @@ data StreamId = StreamId
   { timePart :: Int
   , sequenceNumber :: Word64
   }
-  deriving (Eq, Ord)
+  deriving (Eq, Ord, Bounded)
   deriving (TextShow) via FromStringShow StreamId
 
 instance Show StreamId where
@@ -63,12 +63,15 @@ streamIdRequestParser =
       pure $ Explicit StreamId {..}
 
 streamIdBoundParser :: Word64 -> Parser StreamId
-streamIdBoundParser def = do
-  timePart <- decimal
-  sequenceNumber <- option def $ do
-    void $ string "-"
-    decimal
-  pure $ StreamId {..}
+streamIdBoundParser def =
+  string "-" $> minBound
+    <|> string "+" $> maxBound
+    <|> do
+      timePart <- decimal
+      sequenceNumber <- option def $ do
+        void $ string "-"
+        decimal
+      pure $ StreamId {..}
 
 streamToArray :: Stream -> RespType
 streamToArray str =
