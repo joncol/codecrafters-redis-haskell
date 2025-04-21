@@ -12,7 +12,8 @@ module Stream
   , StreamIdRequest (..)
   , StreamId (..)
   , streamIdRequestParser
-  , streamIdBoundParser
+  , xRangeStreamIdBoundParser
+  , xReadStreamIdBoundParser
   , streamToArray
   ) where
 
@@ -62,8 +63,8 @@ streamIdRequestParser =
       sequenceNumber <- decimal
       pure $ Explicit StreamId {..}
 
-streamIdBoundParser :: Word64 -> Parser StreamId
-streamIdBoundParser def =
+xRangeStreamIdBoundParser :: Word64 -> Parser StreamId
+xRangeStreamIdBoundParser def =
   string "-" $> minBound
     <|> string "+" $> maxBound
     <|> do
@@ -72,6 +73,14 @@ streamIdBoundParser def =
         void $ string "-"
         decimal
       pure $ StreamId {..}
+
+xReadStreamIdBoundParser :: Parser StreamId
+xReadStreamIdBoundParser = do
+  timePart <- decimal
+  sequenceNumber <- option 0 $ do
+    void $ string "-"
+    decimal
+  pure $ StreamId {..}
 
 streamToArray :: Stream -> RespType
 streamToArray str =

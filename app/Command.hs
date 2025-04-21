@@ -16,17 +16,19 @@ module Command
   , isReplicatedCommand
   , (~=)
   , commandFromArray
-  , setOptionsFromArray
+  , setOptionsFromList
   , runCommand
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Arrow ((>>>))
+import Control.Arrow ((***), (>>>))
 import Control.Concurrent.STM
 import Control.Monad
+import Control.Monad.Except (throwError)
 import Control.Monad.Reader
 import Data.Attoparsec.ByteString (parseOnly)
 import Data.ByteString.Char8 qualified as BS8
+import Data.Either (rights)
 import Data.Foldable (toList)
 import Data.Function (on)
 import Data.IORef
@@ -65,6 +67,7 @@ data Command
   | Type Text
   | XAdd StreamKey StreamIdRequest [(Text, Text)]
   | XRange StreamKey (StreamId, StreamId)
+  | XRead (Either RespType XReadOptions)
   deriving (Show)
   deriving (TextShow) via FromStringShow Command
 
@@ -90,6 +93,10 @@ isReplicatedCommand (Wait _ _) = False
 isReplicatedCommand (Type _) = False
 isReplicatedCommand (XAdd {}) = True
 isReplicatedCommand (XRange {}) = False
+isReplicatedCommand (XRead _) = False
+
+(~=) :: Text -> Text -> Bool
+(~=) = (==) `on` T.toCaseFold
 
 newtype SetOptions = SetOptions
   { px :: Maybe Int
@@ -99,8 +106,18 @@ newtype SetOptions = SetOptions
 defaultSetOptions :: SetOptions
 defaultSetOptions = SetOptions {px = Nothing}
 
-(~=) :: Text -> Text -> Bool
-(~=) = (==) `on` T.toCaseFold
+data XReadOptions = XReadOptions
+  { streamKeys :: [StreamKey]
+  , streamIdBounds :: [StreamId]
+  }
+  deriving (Show)
+
+defaultXReadOptions :: XReadOptions
+defaultXReadOptions =
+  XReadOptions
+    { streamKeys = []
+    , streamIdBounds = []
+    }
 
 commandFromArray :: RespType -> Maybe Command
 commandFromArray (Array (BulkString cmd : args))
@@ -108,7 +125,7 @@ commandFromArray (Array (BulkString cmd : args))
   | cmd ~= "echo", [BulkString arg] <- args = Just $ Echo arg
   | cmd ~= "set"
   , BulkString key : BulkString val : options <- args =
-      Just $ Set key val (setOptionsFromArray (Array options) defaultSetOptions)
+      Just $ Set key val (setOptionsFromList options defaultSetOptions)
   | cmd ~= "get", [BulkString key] <- args = Just $ Get key
   | cmd ~= "config"
   , [BulkString configCmd, BulkString configName] <- args
@@ -134,11 +151,13 @@ commandFromArray (Array (BulkString cmd : args))
           Just $ XAdd key streamIdReq (pairs $ getBulkStrings keyVals)
   | cmd ~= "xrange"
   , [BulkString key, BulkString start, BulkString end] <- args =
-      case ( parseOnly (streamIdBoundParser 0) $ TE.encodeUtf8 start
-           , parseOnly (streamIdBoundParser maxBound) $ TE.encodeUtf8 end
+      case ( parseOnly (xRangeStreamIdBoundParser 0) $ TE.encodeUtf8 start
+           , parseOnly (xRangeStreamIdBoundParser maxBound) $ TE.encodeUtf8 end
            ) of
         (Right start', Right end') -> Just $ XRange key (start', end')
         _ -> error "could not parse stream ID bounds"
+  | cmd ~= "xread" =
+      Just $ XRead (xReadOptionsFromList args defaultXReadOptions)
   | otherwise = Nothing
 commandFromArray _ = Nothing
 
@@ -154,15 +173,38 @@ pairs [] = []
 pairs [_] = []
 pairs (x : y : rest) = (x, y) : pairs rest
 
-setOptionsFromArray :: RespType -> SetOptions -> SetOptions
-setOptionsFromArray (Array []) setOptions = setOptions
-setOptionsFromArray (Array (BulkString o : os)) setOptions
+setOptionsFromList :: [RespType] -> SetOptions -> SetOptions
+setOptionsFromList [] options = options
+setOptionsFromList (BulkString o : os) options
   | o ~= "px"
   , BulkString pxVal : os' <- os =
-      setOptionsFromArray
-        (Array os')
-        setOptions {px = Just . read $ T.unpack pxVal}
-setOptionsFromArray _ setOptions = setOptions
+      setOptionsFromList os' options {px = Just . read $ T.unpack pxVal}
+setOptionsFromList _ options = options
+
+xReadOptionsFromList
+  :: [RespType]
+  -> XReadOptions
+  -> Either RespType XReadOptions
+xReadOptionsFromList [] options = pure options
+xReadOptionsFromList (BulkString o : os) _options
+  | o ~= "streams"
+  , even (length os) =
+      let (h1, h2) =
+            getBulkStrings *** getBulkStrings $ splitAt (length os `div` 2) os
+      in  pure
+            XReadOptions
+              { streamKeys = h1
+              , streamIdBounds =
+                  rights $
+                    map (parseOnly xReadStreamIdBoundParser . TE.encodeUtf8) h2
+              }
+  | o ~= "streams" =
+      throwError $
+        SimpleError
+          "ERR Unbalanced 'xread' list of streams: \
+          \for each stream key an ID or '$' must be specified."
+  | otherwise = throwError $ SimpleError "invalid 'xread' options"
+xReadOptionsFromList _ _ = throwError $ SimpleError "invalid 'xread' options"
 
 runCommand
   :: MonadIO m
@@ -192,6 +234,9 @@ runCommand (socket, addr) command = do
       Just <$> runXAddCommand key streamIdReq keyVals
     XRange key (start, end) ->
       Just <$> runXRangeCommand key (start, end)
+    XRead mStreamParams -> case mStreamParams of
+      Left err -> pure $ Just err
+      Right streamParams -> Just <$> runXReadCommand streamParams
 
 runSetCommand :: MonadIO m => Text -> Text -> SetOptions -> RedisM m RespType
 runSetCommand key val options = do
@@ -423,10 +468,10 @@ runTypeCommand :: MonadIO m => Text -> RedisM m RespType
 runTypeCommand key = do
   env <- ask
   dataStore <- liftIO $ readIORef env.dataStore
-  streams <- liftIO $ readIORef env.streams
+  allStreams <- liftIO $ readIORef env.streams
   if
     | key `Map.member` dataStore -> pure $ SimpleString "string"
-    | key `Map.member` streams -> pure $ SimpleString "stream"
+    | key `Map.member` allStreams -> pure $ SimpleString "stream"
     | otherwise -> pure $ SimpleString "none"
 
 runXAddCommand
@@ -437,8 +482,8 @@ runXAddCommand
   -> RedisM m RespType
 runXAddCommand key streamIdReq entries = do
   env <- ask
-  streams <- liftIO $ readIORef env.streams
-  let mOldStream = Map.lookup key streams
+  allStreams <- liftIO $ readIORef env.streams
+  let mOldStream = Map.lookup key allStreams
   case streamIdReq of
     Explicit streamId@(StreamId {timePart, sequenceNumber}) ->
       if timePart == 0 && sequenceNumber == 0
@@ -521,14 +566,30 @@ runXRangeCommand
   -> RedisM m RespType
 runXRangeCommand key (start, end) = do
   env <- ask
-  streams :: Map StreamKey (Seq Stream) <- liftIO $ readIORef env.streams
-  let mStreams :: Maybe (Seq Stream) = Map.lookup key streams
-  case mStreams of
-    Nothing -> pure $ Array []
-    Just (strs :: Seq Stream) -> do
+  allStreams <- liftIO $ readIORef env.streams
+  case Map.lookup key allStreams of
+    Just strs ->
       pure
         . Array
         . map streamToArray
         . toList
-        . Seq.dropWhileL (\(s :: Stream) -> s.streamId < start)
-        $ Seq.dropWhileR (\(s :: Stream) -> end < s.streamId) strs
+        . Seq.dropWhileL (\s -> s.streamId < start)
+        $ Seq.dropWhileR (\s -> end < s.streamId) strs
+    Nothing -> pure $ Array []
+
+runXReadCommand :: MonadIO m => XReadOptions -> RedisM m RespType
+runXReadCommand options = do
+  env <- ask
+  allStreams <- liftIO $ readIORef env.streams
+  let result = Array
+        . flip map (options.streamKeys `zip` options.streamIdBounds)
+        $ \(streamKey, start) -> do
+          case Map.lookup streamKey allStreams of
+            Just strs -> do
+              let streamArrays =
+                    [ Array . map streamToArray . toList $
+                        Seq.dropWhileL (\s -> s.streamId <= start) strs
+                    ]
+              Array $ BulkString streamKey : streamArrays
+            Nothing -> Array []
+  pure result
