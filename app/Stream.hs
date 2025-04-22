@@ -10,6 +10,7 @@ module Stream
   , StreamKey
   , StreamIdRequest (..)
   , StreamId (..)
+  , StreamIdBound (..)
   , streamIdRequestParser
   , xRangeStreamIdBoundParser
   , xReadStreamIdBoundParser
@@ -49,6 +50,10 @@ data StreamId = StreamId
 instance Show StreamId where
   show StreamId {..} = show timePart <> "-" <> show sequenceNumber
 
+-- | This data type is used in connection with the special "$" ID in the XREAD
+-- command.
+data StreamIdBound = AnyEntry StreamId | OnlyNewEntries deriving (Eq, Show)
+
 streamIdRequestParser :: Parser StreamIdRequest
 streamIdRequestParser =
   do
@@ -73,13 +78,15 @@ xRangeStreamIdBoundParser def =
         decimal
       pure $ StreamId {..}
 
-xReadStreamIdBoundParser :: Parser StreamId
-xReadStreamIdBoundParser = do
-  timePart <- decimal
-  sequenceNumber <- option 0 $ do
-    void $ string "-"
-    decimal
-  pure $ StreamId {..}
+xReadStreamIdBoundParser :: Parser StreamIdBound
+xReadStreamIdBoundParser =
+  do
+    timePart <- decimal
+    sequenceNumber <- option 0 $ do
+      void $ string "-"
+      decimal
+    pure $ AnyEntry StreamId {..}
+    <|> string "$" $> OnlyNewEntries
 
 streamToArray :: Stream -> RespType
 streamToArray str =

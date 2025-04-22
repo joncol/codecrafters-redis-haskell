@@ -16,6 +16,7 @@ module Command
   , isReplConfGetAckCommand
   , isReplicatedCommand
   , commandFromArray
+  , fixupXReadOptions
   , runCommand
   ) where
 
@@ -139,6 +140,27 @@ commandFromArray (Array (BulkString cmd : args))
       Just $ XRead (xReadOptionsFromList args defaultXReadOptions)
   | otherwise = Nothing
 commandFromArray _ = Nothing
+
+-- | Replace all occurrences of 'OnlyNewEntries' in 'options' with the latest
+-- stream ID for the relevant stream key.
+fixupXReadOptions :: MonadIO m => Command -> RedisM m Command
+fixupXReadOptions (XRead (Right options)) = do
+  fixedBounds <- forM (options.streamKeys `zip` options.streamIdBounds) $
+    \(streamKey, bound) ->
+      case bound of
+          AnyEntry streamId -> pure $ AnyEntry streamId
+          OnlyNewEntries -> AnyEntry <$> lastStreamId streamKey
+  pure $ XRead (Right options {streamIdBounds = fixedBounds})
+fixupXReadOptions command = pure command
+
+lastStreamId :: MonadIO m => StreamKey -> RedisM m StreamId
+lastStreamId streamKey = do
+  env <- ask
+  allStreams <- liftIO $ readTVarIO env.streams
+  case Map.lookup streamKey allStreams of
+    Just (_ :|> lastStr) -> pure lastStr.streamId
+    Just Seq.Empty -> error "no stream with that key found"
+    Nothing -> pure StreamId {timePart = 0, sequenceNumber = 1}
 
 pairs :: [a] -> [(a, a)]
 pairs [] = []
@@ -520,29 +542,29 @@ runXReadCommand options
                   <* (readTVar timeouted >>= check)
           else
             atomically (getResult env) >>= \case
-              Just result -> pure result
-              Nothing -> do
+              Just result | True -> pure result
+              _ -> do
                 -- Set the shared variable that indicates what streams we are
                 -- interested in.
                 putMVar env.xReadBlockOptions options
                 -- Wait until we have some data to return.
-                putStrLn "waiting for semaphore"
                 takeMVar env.xReadBlockSem
-                putStrLn "waiting done"
                 atomically $ fromMaybe NullBulkString <$> getResult env
   where
     getResult :: RedisEnv -> STM (Maybe RespType)
     getResult env = runMaybeT $ do
       allStreams <- lift $ readTVar env.streams
       result <- forM (options.streamKeys `zip` options.streamIdBounds) $
-        \(streamKey, start) ->
-          case Map.lookup streamKey allStreams of
-            Just strs -> do
-              let strs' = Seq.dropWhileL (\s -> s.streamId <= start) strs
-              if Seq.null strs'
-                then fail "no streams"
-                else
-                  let streamArrays = [Array . map streamToArray $ toList strs']
-                  in  pure . Array $ BulkString streamKey : streamArrays
-            Nothing -> fail "no stream for key"
+        \(streamKey, start) -> case Map.lookup streamKey allStreams of
+          -- At this point, `fixupXReadOptions` should have made all stream ID
+          -- bounds be of the `AnyEntry` variant.
+          Just strs | AnyEntry start' <- start -> do
+            let strs' = Seq.dropWhileL (\s -> s.streamId <= start') strs
+            if Seq.null strs'
+              then fail "no streams"
+              else
+                let streamArrays = [Array . map streamToArray $ toList strs']
+                in  pure . Array $ BulkString streamKey : streamArrays
+          Nothing -> fail "no stream for key"
+          _ -> fail "unexpected error"
       pure $ Array result

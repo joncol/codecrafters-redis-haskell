@@ -46,7 +46,7 @@ setOptionsFromList _ options = options
 
 data XReadOptions = XReadOptions
   { streamKeys :: [StreamKey]
-  , streamIdBounds :: [StreamId]
+  , streamIdBounds :: [StreamIdBound]
   , blockTimeout :: Maybe Int
   }
   deriving (Show)
@@ -94,6 +94,11 @@ isXReadUnblockedBy :: XReadOptions -> StreamKey -> StreamId -> Bool
 isXReadUnblockedBy options streamKey streamId =
   any
     ( \(streamKey', streamIdBound) ->
-        streamKey == streamKey' && streamIdBound < streamId
+        case streamIdBound of
+          AnyEntry streamIdBound' ->
+            streamKey == streamKey' && streamIdBound' < streamId
+          -- This function is only called when new entries are added, so we can
+          -- safely return `True` here.
+          OnlyNewEntries -> True
     )
     $ options.streamKeys `zip` options.streamIdBounds

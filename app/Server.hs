@@ -37,6 +37,7 @@ runServer (socket, addr) = do
   env <- ask
   void (A.parsed parseCommand (fromSocket socket bufferSize))
     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
+    >-> P.mapM (\(cmdArray, cmd) -> (cmdArray,) <$> fixupXReadOptions cmd)
     >-> P.wither
       ( \(cmdArray, cmd) ->
           fmap ((cmdArray, cmd),) <$> runCommand (socket, addr) cmd

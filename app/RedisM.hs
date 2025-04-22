@@ -12,7 +12,6 @@ import Control.Monad.Reader
 import RedisEnv
 
 newtype RedisM m a = RedisM
-  -- { runRedisM :: ReaderT RedisEnv (S.Stream (S.Of (Maybe RespType)) m) a
   { runRedisM :: ReaderT RedisEnv m a
   }
   deriving
