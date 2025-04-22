@@ -14,23 +14,19 @@ module Command
   , isPsyncCommand
   , isReplConfGetAckCommand
   , isReplicatedCommand
-  , (~=)
   , commandFromArray
-  , setOptionsFromList
   , runCommand
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Arrow ((***), (>>>))
+import Control.Arrow ((>>>))
 import Control.Concurrent.STM
 import Control.Monad
-import Control.Monad.Except (throwError)
+import Control.Monad.Except
 import Control.Monad.Reader
 import Data.Attoparsec.ByteString (parseOnly)
 import Data.ByteString.Char8 qualified as BS8
-import Data.Either (rights)
 import Data.Foldable (toList)
-import Data.Function (on)
 import Data.IORef
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -42,16 +38,19 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time.Clock
 import Data.Time.Clock.POSIX
+import Data.Word (Word64)
 import Network.Socket (SockAddr, Socket, getPeerName)
 import Network.Socket.ByteString (sendAll)
 import Text.Read (readMaybe)
 import TextShow
 
+import CommandOptions
 import Options
 import RedisEnv
 import RedisM
 import RespType
 import Stream
+import Util
 
 data Command
   = Ping
@@ -95,32 +94,6 @@ isReplicatedCommand (XAdd {}) = True
 isReplicatedCommand (XRange {}) = False
 isReplicatedCommand (XRead _) = False
 
-(~=) :: Text -> Text -> Bool
-(~=) = (==) `on` T.toCaseFold
-
-newtype SetOptions = SetOptions
-  { px :: Maybe Int
-  }
-  deriving (Show)
-
-defaultSetOptions :: SetOptions
-defaultSetOptions = SetOptions {px = Nothing}
-
-data XReadOptions = XReadOptions
-  { streamKeys :: [StreamKey]
-  , streamIdBounds :: [StreamId]
-  , blockTimeout :: Maybe Int
-  }
-  deriving (Show)
-
-defaultXReadOptions :: XReadOptions
-defaultXReadOptions =
-  XReadOptions
-    { streamKeys = []
-    , streamIdBounds = []
-    , blockTimeout = Nothing
-    }
-
 commandFromArray :: RespType -> Maybe Command
 commandFromArray (Array (BulkString cmd : args))
   | cmd ~= "ping" = Just Ping
@@ -163,54 +136,10 @@ commandFromArray (Array (BulkString cmd : args))
   | otherwise = Nothing
 commandFromArray _ = Nothing
 
-getBulkStrings :: [RespType] -> [Text]
-getBulkStrings = foldMap getBulkString
-  where
-    getBulkString :: RespType -> [Text]
-    getBulkString (BulkString s) = [s]
-    getBulkString _ = []
-
 pairs :: [a] -> [(a, a)]
 pairs [] = []
 pairs [_] = []
 pairs (x : y : rest) = (x, y) : pairs rest
-
-setOptionsFromList :: [RespType] -> SetOptions -> SetOptions
-setOptionsFromList [] options = options
-setOptionsFromList (BulkString o : os) options
-  | o ~= "px"
-  , BulkString pxVal : os' <- os =
-      setOptionsFromList os' options {px = Just . read $ T.unpack pxVal}
-setOptionsFromList _ options = options
-
-xReadOptionsFromList
-  :: [RespType]
-  -> XReadOptions
-  -> Either RespType XReadOptions
-xReadOptionsFromList [] options = pure options
-xReadOptionsFromList (BulkString o : os) options
-  | o ~= "block"
-  , BulkString blockTimeout : os' <- os =
-      xReadOptionsFromList os' $
-        options {blockTimeout = Just . read $ T.unpack blockTimeout}
-  | o ~= "streams"
-  , even (length os) =
-      let (h1, h2) =
-            getBulkStrings *** getBulkStrings $ splitAt (length os `div` 2) os
-      in  pure
-            options
-              { streamKeys = h1
-              , streamIdBounds =
-                  rights $
-                    map (parseOnly xReadStreamIdBoundParser . TE.encodeUtf8) h2
-              }
-  | o ~= "streams" =
-      throwError $
-        SimpleError
-          "ERR Unbalanced 'xread' list of streams: \
-          \for each stream key an ID or '$' must be specified."
-  | otherwise = throwError $ SimpleError "invalid 'xread' options"
-xReadOptionsFromList _ _ = throwError $ SimpleError "invalid 'xread' options"
 
 runCommand
   :: MonadIO m
@@ -474,38 +403,37 @@ runTypeCommand key = do
     | otherwise -> pure $ SimpleString "none"
 
 runXAddCommand
-  :: MonadIO m
+  :: forall m
+   . MonadIO m
   => StreamKey
   -> StreamIdRequest
   -> [(Text, Text)]
   -> RedisM m RespType
-runXAddCommand key streamIdReq entries = do
-  env <- ask
-  allStreams <- liftIO $ readTVarIO env.streams
-  let mOldStream = Map.lookup key allStreams
-  case streamIdReq of
-    Explicit streamId@(StreamId {timePart, sequenceNumber}) ->
-      if timePart == 0 && sequenceNumber == 0
-        then pure idMustBeGreaterThanZeroError
-        else case mOldStream of
+runXAddCommand streamKey streamIdReq entries = do
+  -- TODO: Generalize error handling so that all command handlers can
+  -- `throwError`.
+  mResult <- runExceptT $ do
+    env <- ask
+    allStreams <- liftIO $ readTVarIO env.streams
+    let mOldStream = Map.lookup streamKey allStreams
+    (timePart, mSequenceNumber) <- case streamIdReq of
+      Explicit streamId@(StreamId {timePart, sequenceNumber}) -> do
+        when (timePart == 0 && sequenceNumber == 0) $
+          throwError idMustBeGreaterThanZeroError
+        case mOldStream of
           Just (_ :|> lastStream)
-            | streamId <= lastStream.streamId -> pure idTooSmallError
-          _ -> do
-            let newStream =
-                  Seq.singleton $
-                    Stream
-                      { streamId = streamId
-                      , entries
-                      }
-            liftIO . atomically . modifyTVar' env.streams $
-              Map.insertWith ins key newStream
-            pure . BulkString $ showt streamId
-    TimePart timePart -> do
-      addEntry env.streams mOldStream timePart
-    Implicit -> do
-      t <- liftIO getPOSIXTime
-      let timePart = floor $ nominalDiffTimeToSeconds t * 1000
-      addEntry env.streams mOldStream timePart
+            | streamId <= lastStream.streamId -> throwError idTooSmallError
+          _ -> pure (timePart, Just sequenceNumber)
+      TimePart timePart -> pure (timePart, Nothing)
+      Implicit -> do
+        t <- liftIO getPOSIXTime
+        let timePart = floor $ nominalDiffTimeToSeconds t * 1000
+        pure (timePart, Nothing)
+
+    addEntry env.streams mOldStream timePart mSequenceNumber
+  case mResult of
+    Right result -> pure result
+    Left err -> pure err
   where
     idMustBeGreaterThanZeroError =
       SimpleError "ERR The ID specified in XADD must be greater than 0-0"
@@ -520,43 +448,25 @@ runXAddCommand key streamIdReq entries = do
       => TVar (Map StreamKey (Seq Stream))
       -> Maybe (Seq Stream)
       -> Int
-      -> RedisM m RespType
-    addEntry streams mOldStream timePart = do
+      -> Maybe Word64
+      -> ExceptT RespType (RedisM m) RespType
+    addEntry streams mOldStream timePart mSequenceNumber = do
       let mOldStream' =
             Seq.filter (\str -> str.streamId.timePart == timePart)
               <$> mOldStream
-      case mOldStream' of
-        Just (_ :|> lastStream) -> do
-          let streamId =
-                StreamId
-                  { timePart
-                  , sequenceNumber = lastStream.streamId.sequenceNumber + 1
-                  }
-          let newStream =
-                Seq.singleton $
-                  Stream
-                    { streamId = streamId
-                    , entries
-                    }
-          liftIO . atomically . modifyTVar' streams $
-            Map.insertWith ins key newStream
-          pure . BulkString $ showt streamId
-        _ -> do
-          let streamId =
-                StreamId
-                  { timePart
-                  , sequenceNumber = if timePart == 0 then 1 else 0
-                  }
-          let newStream =
-                Seq.singleton $
-                  Stream
-                    { streamId = streamId
-                    , entries
-                    }
-          liftIO . atomically . modifyTVar' streams $
-            Map.insertWith ins key newStream
-          pure . BulkString $ showt streamId
-
+      let sequenceNumber =
+            fromMaybe
+              ( case mOldStream' of
+                  Just (_ :|> lastStream) ->
+                    lastStream.streamId.sequenceNumber + 1
+                  _ -> if timePart == 0 then 1 else 0
+              )
+              mSequenceNumber
+      let streamId = StreamId {timePart, sequenceNumber}
+      let newStream = Seq.singleton $ Stream {streamId, entries}
+      liftIO . atomically . modifyTVar' streams $
+        Map.insertWith ins streamKey newStream
+      pure . BulkString $ showt streamId
     ins :: Seq Stream -> Seq Stream -> Seq Stream
     ins _ Seq.Empty = error "should be unreachable"
     ins newStream oldStream = oldStream <> newStream
@@ -584,10 +494,13 @@ runXReadCommand options
   | Nothing <- options.blockTimeout = liftIO . atomically . getResult =<< ask
   | Just blockTimeout <- options.blockTimeout = do
       env <- ask
-      -- See: https://gist.github.com/vdorr/cfc97e298d34d0a586012cdea0972e37.
       liftIO $
-        registerDelay (blockTimeout * 1000) >>= \timeouted -> do
-          atomically $ getResult env <* (readTVar timeouted >>= check)
+        if blockTimeout > 0
+          then
+            -- See: https://gist.github.com/vdorr/cfc97e298d34d0a586012cdea0972e37.
+            registerDelay (blockTimeout * 1000) >>= \timeouted ->
+              atomically $ getResult env <* (readTVar timeouted >>= check)
+          else error "not implemented"
   where
     getResult :: RedisEnv -> STM RespType
     getResult env = do

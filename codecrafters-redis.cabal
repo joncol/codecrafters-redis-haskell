@@ -13,6 +13,7 @@ executable codecrafters-redis-exe
   main-is: Main.hs
   other-modules:
       Command
+      CommandOptions
       DataStore
       Options
       RdbParser
@@ -23,6 +24,7 @@ executable codecrafters-redis-exe
       RespType
       Server
       Stream
+      Util
       Paths_codecrafters_redis
   hs-source-dirs:
       app
@@ -33,6 +35,7 @@ executable codecrafters-redis-exe
     , base >=4.19 && <5
     , bytestring
     , containers
+    , extra
     , megaparsec
     , mtl
     , network

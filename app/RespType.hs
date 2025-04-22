@@ -1,4 +1,3 @@
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE NegativeLiterals #-}
@@ -8,6 +7,7 @@ module RespType
   ( RespType (..)
   , ok
   , crlf
+  , getBulkStrings
   )
 where
 
@@ -62,3 +62,10 @@ ok = SimpleString "OK"
 
 crlf :: String
 crlf = "\r\n"
+
+getBulkStrings :: [RespType] -> [Text]
+getBulkStrings = foldMap getBulkString
+  where
+    getBulkString :: RespType -> [Text]
+    getBulkString (BulkString s) = [s]
+    getBulkString _ = []
