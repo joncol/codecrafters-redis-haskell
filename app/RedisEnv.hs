@@ -12,6 +12,7 @@ module RedisEnv
   , Value (..)
   ) where
 
+import Control.Concurrent
 import Control.Concurrent.STM.TVar
 import Data.ByteString.Lazy qualified as LBS
 import Data.IORef
@@ -24,6 +25,7 @@ import Network.Socket (SockAddr, Socket)
 import System.IO.Error
 import Text.Megaparsec (parseMaybe)
 
+import CommandOptions
 import DataStore
 import Options
 import RdbParser qualified
@@ -44,6 +46,8 @@ data RedisEnv = RedisEnv
   -- ^ Number of command bytes sent from the master node. Only used by replicas.
   , masterOffset :: TVar Int
   -- ^ Number of command bytes sent from the master node. Only used by masters.
+  , xReadBlockSem :: MVar ()
+  , xReadBlockOptions :: MVar XReadOptions
   }
 
 data ReplicaInfo = ReplicaInfo
@@ -61,6 +65,8 @@ initialEnv = do
   replicas <- newTVarIO Map.empty
   replicaOffset <- newIORef 0
   masterOffset <- newTVarIO 0
+  xReadBlockSem <- newEmptyMVar
+  xReadBlockOptions <- newEmptyMVar
   pure
     RedisEnv
       { dataStore
@@ -75,6 +81,8 @@ initialEnv = do
       , replicas
       , replicaOffset
       , masterOffset
+      , xReadBlockSem
+      , xReadBlockOptions
       }
   where
     createDataStore :: Options -> IO (IORef DataStore)

@@ -1,5 +1,6 @@
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedRecordDot #-}
@@ -20,10 +21,13 @@ module Command
 
 import Control.Applicative ((<|>))
 import Control.Arrow ((>>>))
+import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Monad
 import Control.Monad.Except
+import Control.Monad.Extra (whenJustM)
 import Control.Monad.Reader
+import Control.Monad.Trans.Maybe (runMaybeT)
 import Data.Attoparsec.ByteString (parseOnly)
 import Data.ByteString.Char8 qualified as BS8
 import Data.Foldable (toList)
@@ -466,9 +470,19 @@ runXAddCommand streamKey streamIdReq entries = do
       let newStream = Seq.singleton $ Stream {streamId, entries}
       liftIO . atomically . modifyTVar' streams $
         Map.insertWith ins streamKey newStream
+
+      env <- ask
+      liftIO $ do
+        whenJustM (tryReadMVar env.xReadBlockOptions) $
+          \options ->
+            when (isXReadUnblockedBy options streamKey streamId) $
+              -- Signal semaphore. This unblocks waiting in "XREAD".
+              putMVar env.xReadBlockSem ()
+
       pure . BulkString $ showt streamId
+
     ins :: Seq Stream -> Seq Stream -> Seq Stream
-    ins _ Seq.Empty = error "should be unreachable"
+    ins _ Seq.Empty = error "unreachable"
     ins newStream oldStream = oldStream <> newStream
 
 runXRangeCommand
@@ -491,7 +505,8 @@ runXRangeCommand key (start, end) = do
 
 runXReadCommand :: MonadIO m => XReadOptions -> RedisM m RespType
 runXReadCommand options
-  | Nothing <- options.blockTimeout = liftIO . atomically . getResult =<< ask
+  | Nothing <- options.blockTimeout =
+      liftIO . atomically . fmap (fromMaybe NullBulkString) . getResult =<< ask
   | Just blockTimeout <- options.blockTimeout = do
       env <- ask
       liftIO $
@@ -499,25 +514,35 @@ runXReadCommand options
           then
             -- See: https://gist.github.com/vdorr/cfc97e298d34d0a586012cdea0972e37.
             registerDelay (blockTimeout * 1000) >>= \timeouted ->
-              atomically $ getResult env <* (readTVar timeouted >>= check)
-          else error "not implemented"
+              atomically $
+                fromMaybe NullBulkString
+                  <$> getResult env
+                  <* (readTVar timeouted >>= check)
+          else
+            atomically (getResult env) >>= \case
+              Just result -> pure result
+              Nothing -> do
+                -- Set the shared variable that indicates what streams we are
+                -- interested in.
+                putMVar env.xReadBlockOptions options
+                -- Wait until we have some data to return.
+                putStrLn "waiting for semaphore"
+                takeMVar env.xReadBlockSem
+                putStrLn "waiting done"
+                atomically $ fromMaybe NullBulkString <$> getResult env
   where
-    getResult :: RedisEnv -> STM RespType
-    getResult env = do
-      allStreams <- readTVar env.streams
-      let result = Array
-            . flip map (options.streamKeys `zip` options.streamIdBounds)
-            $ \(streamKey, start) -> do
-              case Map.lookup streamKey allStreams of
-                Just strs -> do
-                  let strs' = Seq.dropWhileL (\s -> s.streamId <= start) strs
-                  if Seq.null strs'
-                    then NullBulkString
-                    else
-                      let streamArrays =
-                            [ Array . map streamToArray $
-                                toList strs'
-                            ]
-                      in  Array $ BulkString streamKey : streamArrays
-                Nothing -> Array []
-      pure result
+    getResult :: RedisEnv -> STM (Maybe RespType)
+    getResult env = runMaybeT $ do
+      allStreams <- lift $ readTVar env.streams
+      result <- forM (options.streamKeys `zip` options.streamIdBounds) $
+        \(streamKey, start) ->
+          case Map.lookup streamKey allStreams of
+            Just strs -> do
+              let strs' = Seq.dropWhileL (\s -> s.streamId <= start) strs
+              if Seq.null strs'
+                then fail "no streams"
+                else
+                  let streamArrays = [Array . map streamToArray $ toList strs']
+                  in  pure . Array $ BulkString streamKey : streamArrays
+            Nothing -> fail "no stream for key"
+      pure $ Array result

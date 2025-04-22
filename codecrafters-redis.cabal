@@ -50,4 +50,5 @@ executable codecrafters-redis-exe
     , text
     , text-show
     , time
+    , transformers
   default-language: Haskell2010
