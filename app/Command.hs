@@ -580,4 +580,4 @@ runIncrCommand key =
       let n' = n + 1
       void $ runSetCommand key (showt n') defaultSetOptions
       pure $ Integer n'
-    _ -> error "not implemented"
+    _ -> pure $ SimpleError "ERR value is not an integer or out of range"
