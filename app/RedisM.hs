@@ -1,6 +1,3 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# OPTIONS_GHC -Wall #-}
-
 module RedisM
   ( RedisM (..)
   , bufferSize

@@ -1,8 +1,3 @@
-{-# LANGUAGE DerivingVia #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE NegativeLiterals #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module RespType
   ( RespType (..)
   , ok

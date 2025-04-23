@@ -1,10 +1,3 @@
-{-# LANGUAGE DerivingVia #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE NoFieldSelectors #-}
-{-# OPTIONS_GHC -Wall #-}
-
 module Stream
   ( Stream (..)
   , StreamKey
