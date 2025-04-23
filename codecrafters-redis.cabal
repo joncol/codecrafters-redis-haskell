@@ -40,7 +40,6 @@ executable codecrafters-redis-exe
     , mtl
     , network
     , network-simple
-    , optics
     , parsec
     , parser-combinators
     , pipes

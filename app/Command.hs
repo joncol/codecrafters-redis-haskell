@@ -72,6 +72,7 @@ data Command
   | XAdd StreamKey StreamIdRequest [(Text, Text)]
   | XRange StreamKey (StreamId, StreamId)
   | XRead (Either RespType XReadOptions)
+  | Incr Text
   deriving (Show)
   deriving (TextShow) via FromStringShow Command
 
@@ -98,6 +99,7 @@ isReplicatedCommand (Type _) = False
 isReplicatedCommand (XAdd {}) = True
 isReplicatedCommand (XRange {}) = False
 isReplicatedCommand (XRead _) = False
+isReplicatedCommand (Incr _) = True
 
 commandFromArray :: RespType -> Maybe Command
 commandFromArray (Array (BulkString cmd : args))
@@ -138,6 +140,9 @@ commandFromArray (Array (BulkString cmd : args))
         _ -> error "could not parse stream ID bounds"
   | cmd ~= "xread" =
       Just $ XRead (xReadOptionsFromList args defaultXReadOptions)
+  | cmd ~= "incr"
+  , BulkString key : _ <- args =
+      Just $ Incr key
   | otherwise = Nothing
 commandFromArray _ = Nothing
 
@@ -148,8 +153,8 @@ fixupXReadOptions (XRead (Right options)) = do
   fixedBounds <- forM (options.streamKeys `zip` options.streamIdBounds) $
     \(streamKey, bound) ->
       case bound of
-          AnyEntry streamId -> pure $ AnyEntry streamId
-          OnlyNewEntries -> AnyEntry <$> lastStreamId streamKey
+        AnyEntry streamId -> pure $ AnyEntry streamId
+        OnlyNewEntries -> AnyEntry <$> lastStreamId streamKey
   pure $ XRead (Right options {streamIdBounds = fixedBounds})
 fixupXReadOptions command = pure command
 
@@ -173,15 +178,11 @@ runCommand
   -> Command
   -> RedisM m (Maybe RespType)
 runCommand (socket, addr) command = do
-  liftIO . putStrLn $ "-> runCommand, command: " <> show command
   case command of
     Ping -> pure . Just $ SimpleString "PONG"
     Echo s -> pure . Just $ BulkString s
     Set key val options -> Just <$> runSetCommand key val options
-    Get key -> do
-      result <- Just <$> runGetCommand key
-      liftIO $ putStrLn "<- runCommand"
-      pure result
+    Get key -> Just <$> runGetCommand key
     ConfigGet configName -> Just <$> runConfigGetCommand configName
     Keys pat -> Just <$> runKeysCommand pat
     Info section -> Just <$> runInfoCommand section
@@ -198,6 +199,7 @@ runCommand (socket, addr) command = do
     XRead mStreamParams -> case mStreamParams of
       Left err -> pure $ Just err
       Right streamParams -> Just <$> runXReadCommand streamParams
+    Incr key -> Just <$> runIncrCommand key
 
 runSetCommand :: MonadIO m => Text -> Text -> SetOptions -> RedisM m RespType
 runSetCommand key val options = do
@@ -568,3 +570,9 @@ runXReadCommand options
           Nothing -> fail "no stream for key"
           _ -> fail "unexpected error"
       pure $ Array result
+
+runIncrCommand :: MonadIO m => Text -> RedisM m RespType
+runIncrCommand key =
+  runGetCommand key >>= \case
+    BulkString s | Just n <- readMaybe (T.unpack s) -> pure . Integer $ n + 1
+    _ -> error "not implemented"
