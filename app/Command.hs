@@ -17,7 +17,8 @@ module Command
   , isReplicatedCommand
   , commandFromArray
   , fixupXReadOptions
-  , runCommand
+  , runOrQueueCommand
+  , isTransactionActive
   ) where
 
 import Control.Applicative ((<|>))
@@ -179,6 +180,32 @@ pairs [] = []
 pairs [_] = []
 pairs (x : y : rest) = (x, y) : pairs rest
 
+runOrQueueCommand
+  :: MonadIO m
+  => (Socket, SockAddr)
+  -> Command
+  -> RedisM m (Maybe RespType)
+runOrQueueCommand (socket, addr) command = do
+  peerName <- liftIO $ getPeerName socket
+  txActive <- isTransactionActive peerName
+
+  let isExecCommand = case command of Exec -> True; _ -> False
+
+  if not txActive || isExecCommand
+    then runCommand (socket, addr) command
+    else Just <$> queueCommand command
+
+-- | Helper function that checks if there's an active transaction for a given
+-- 'peerName'.
+isTransactionActive :: MonadIO m => SockAddr -> RedisM m Bool
+isTransactionActive peerName = do
+  env <- ask
+  multiTransactions <- liftIO $ readTVarIO env.multiTransactions
+  let mTransactionInfo = Map.lookup peerName multiTransactions
+  case mTransactionInfo of
+    Just transactionInfo -> pure transactionInfo.active
+    Nothing -> pure False
+
 runCommand
   :: MonadIO m
   => (Socket, SockAddr)
@@ -207,8 +234,12 @@ runCommand (socket, addr) command = do
       Left err -> pure $ Just err
       Right streamParams -> Just <$> runXReadCommand streamParams
     Incr key -> Just <$> runIncrCommand key
-    Multi -> Just <$> runMultiCommand
-    Exec -> Just <$> runExecCommand
+    Multi -> Just <$> runMultiCommand (socket, addr)
+    Exec -> Just <$> runExecCommand (socket, addr)
+
+queueCommand :: MonadIO m => Command -> RedisM m RespType
+queueCommand _command = do
+  pure $ SimpleString "QUEUED"
 
 runSetCommand :: MonadIO m => Text -> Text -> SetOptions -> RedisM m RespType
 runSetCommand key val options = do
@@ -327,17 +358,13 @@ runReplConfCommand (socket, _addr) key val
               , "ACK"
               , T.pack $ show replOffset
               ]
-        else do
-          liftIO $ putStrLn "Not sending ACK"
-          pure Nothing
+        else pure Nothing
   | key ~= "ack" = do
       -- Update the last known replica offset.
       let replicaOffset :: Maybe Int = readMaybe $ T.unpack val
-      liftIO . putStrLn $ "REPLCONF ACK received, val: " <> show replicaOffset
       env <- ask
       liftIO $ do
         peerName <- getPeerName socket
-        putStrLn $ "peerName: " <> show peerName
         atomically $ do
           repls <- readTVar env.replicas
           writeTVar env.replicas $
@@ -350,14 +377,6 @@ runReplConfCommand (socket, _addr) key val
               peerName
               repls
 
-      -- Debug print.
-      replicas <- liftIO $ readTVarIO env.replicas
-      liftIO . putStrLn $
-        "updated replica offsets: "
-          <> show (map lastKnownReplicaOffset $ Map.elems replicas)
-
-      liftIO . putStrLn $ "replicas: " <> show replicas
-
       pure Nothing
   | otherwise = error $ "unknown REPLCONF key: " <> show key
 
@@ -368,35 +387,19 @@ runPsyncCommand _replicationId _offset = do
 
 runWaitCommand :: MonadIO m => Int -> Int -> RedisM m RespType
 runWaitCommand numReplicas timeout = do
-  liftIO $ putStrLn "-> runWaitCommand"
-
   env <- ask
   masterOffset <- liftIO $ readTVarIO env.masterOffset
-  liftIO . putStrLn $ "masterOffset: " <> show masterOffset
   initialUpToDateCount <-
     liftIO . atomically $ caughtUpReplicaCount env masterOffset
-  liftIO . putStrLn $ "initialUpToDateCount: " <> show initialUpToDateCount
-
   replicas <- liftIO $ readTVarIO env.replicas
-  liftIO . putStrLn $
-    "replica offsets: "
-      <> show (map lastKnownReplicaOffset $ Map.elems replicas)
 
   if
     | masterOffset == 0 -> pure . Integer $ length replicas
-    | numReplicas <= initialUpToDateCount -> do
-        liftIO . putStrLn $
-          "simple case, returning early, up-to-date-count: "
-            <> show initialUpToDateCount
-        pure $ Integer initialUpToDateCount
+    | numReplicas <= initialUpToDateCount -> pure $ Integer initialUpToDateCount
     | otherwise -> liftIO $ do
         let replConfGetAck = Array $ map BulkString ["REPLCONF", "GETACK", "*"]
 
-        forM_ replicas $ \replica -> do
-          putStr "sending REPLCONF GETACK ("
-          print $ show replConfGetAck
-          putStrLn $ ") to socket: " <> show replica.socket
-
+        forM_ replicas $ \replica ->
           -- Send a REPLCONF GETACK to each replica. The response is handled
           -- in "Command.runReplConfCommand".
           sendAll replica.socket . BS8.pack $ show replConfGetAck
@@ -590,18 +593,24 @@ runIncrCommand key =
       pure $ Integer n'
     _ -> pure $ SimpleError "ERR value is not an integer or out of range"
 
-runMultiCommand :: MonadIO m => RedisM m RespType
-runMultiCommand = do
+runMultiCommand :: MonadIO m => (Socket, SockAddr) -> RedisM m RespType
+runMultiCommand (socket, _addr) = do
   env <- ask
-  liftIO . atomically $ writeTVar env.multiTransactionActive True
+  peerName <- liftIO $ getPeerName socket
+  liftIO . atomically . modifyTVar' env.multiTransactions $
+    Map.insert peerName TransactionInfo {active = True}
+  liftIO $ putStrLn "starting MULTI transaction"
   pure ok
 
-runExecCommand :: MonadIO m => RedisM m RespType
-runExecCommand = do
+runExecCommand :: MonadIO m => (Socket, SockAddr) -> RedisM m RespType
+runExecCommand (socket, _addr) = do
   env <- ask
-  multiTransactionActive <- liftIO $ readTVarIO env.multiTransactionActive
-  if multiTransactionActive
+  peerName <- liftIO $ getPeerName socket
+  txActive <- isTransactionActive peerName
+  if txActive
     then do
-      liftIO . atomically $ writeTVar env.multiTransactionActive False
+      liftIO . atomically . modifyTVar' env.multiTransactions $
+        Map.insert peerName TransactionInfo {active = False}
+      liftIO $ putStrLn "finishing MULTI transaction, due to EXEC"
       pure $ Array []
     else pure $ SimpleError "ERR EXEC without MULTI"

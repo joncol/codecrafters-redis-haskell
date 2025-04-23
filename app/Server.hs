@@ -1,4 +1,5 @@
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -35,12 +36,12 @@ import RespType
 runServer :: MonadIO m => (Socket, SockAddr) -> Effect (RedisM m) ()
 runServer (socket, addr) = do
   env <- ask
-  void (A.parsed parseCommand (fromSocket socket bufferSize))
+  void (A.parsed parseCommand $ fromSocket socket bufferSize)
     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
     >-> P.mapM (\(cmdArray, cmd) -> (cmdArray,) <$> fixupXReadOptions cmd)
     >-> P.wither
       ( \(cmdArray, cmd) ->
-          fmap ((cmdArray, cmd),) <$> runCommand (socket, addr) cmd
+          fmap ((cmdArray, cmd),) <$> runOrQueueCommand (socket, addr) cmd
       )
     >-> P.tee
       ( P.map snd -- throw away the commands and only keep the results
@@ -61,23 +62,20 @@ runServer (socket, addr) = do
     >-> P.filter (\((_cmdArray, cmd), _res) -> isReplicatedCommand cmd)
     >-> P.mapM_
       ( \((cmdArray, _cmd), _res) ->
-          when env.isMasterNode $ propagateCommandToReplicas env cmdArray
+          propagateCommandToReplicas (socket, addr) cmdArray
       )
   where
     parseCommand = A.choice [psyncResponse, rdbData, array]
 
 sendRdbDataToReplica :: MonadIO m => Socket -> m ()
 sendRdbDataToReplica socket = do
-  liftIO $ putStrLn "sending RDB data to replica"
   let rdb = BS8.pack ("$" <> show (length emptyRdb) <> crlf) <> BS.pack emptyRdb
   liftIO $ sendAll socket rdb
 
 saveReplicaConnection :: MonadIO m => (Socket, SockAddr) -> RedisEnv -> m ()
 saveReplicaConnection (socket, _addr) redisEnv = do
   liftIO $ do
-    putStrLn $ "storing replica connection, socket: " <> show socket
     peerName <- getPeerName socket
-    putStrLn $ "peerName: " <> show peerName
     -- TODO: Handle lost replica connections.
     let replicaInfo =
           ReplicaInfo
@@ -89,19 +87,26 @@ saveReplicaConnection (socket, _addr) redisEnv = do
       writeTVar redisEnv.replicas $
         Map.insert peerName replicaInfo replicas
 
-propagateCommandToReplicas :: MonadIO m => RedisEnv -> RespType -> m ()
-propagateCommandToReplicas redisEnv cmdArray = do
-  -- Increment `masterOffset`.
-  liftIO . atomically $ do
-    masterOffset <- readTVar redisEnv.masterOffset
-    writeTVar redisEnv.masterOffset $ masterOffset + length (show cmdArray)
+propagateCommandToReplicas
+  :: MonadIO m
+  => (Socket, SockAddr)
+  -> RespType
+  -> RedisM m ()
+propagateCommandToReplicas (socket, _addr) cmdArray = do
+  env <- ask
 
-  replicas <- liftIO $ readTVarIO redisEnv.replicas
-  forM_ replicas $ \replica -> liftIO $ do
-    putStr "sending replicated command ("
-    print $ show cmdArray
-    putStrLn $ ") to socket: " <> show replica.socket
-    sendAll replica.socket . BS8.pack $ show cmdArray
+  peerName <- liftIO $ getPeerName socket
+  txActive <- isTransactionActive peerName
+
+  when (env.isMasterNode && not txActive) $ do
+    -- Increment `masterOffset`.
+    liftIO . atomically $ do
+      masterOffset <- readTVar env.masterOffset
+      writeTVar env.masterOffset $ masterOffset + length (show cmdArray)
+
+    replicas <- liftIO $ readTVarIO env.replicas
+    forM_ replicas $ \replica ->
+      liftIO . sendAll replica.socket . BS8.pack $ show cmdArray
 
 emptyRdb :: [Word8]
 emptyRdb =

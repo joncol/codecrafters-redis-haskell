@@ -8,6 +8,7 @@ module RedisEnv
   ( RedisEnv (..)
   , initialEnv
   , ReplicaInfo (..)
+  , TransactionInfo (..)
   , DataStore
   , Value (..)
   ) where
@@ -48,12 +49,17 @@ data RedisEnv = RedisEnv
   -- ^ Number of command bytes sent from the master node. Only used by masters.
   , xReadBlockSem :: MVar ()
   , xReadBlockOptions :: MVar XReadOptions
-  , multiTransactionActive :: TVar Bool
+  , multiTransactions :: TVar (Map SockAddr TransactionInfo)
   }
 
 data ReplicaInfo = ReplicaInfo
   { socket :: Socket
   , lastKnownReplicaOffset :: Int
+  }
+  deriving (Show)
+
+data TransactionInfo = TransactionInfo
+  { active :: Bool
   }
   deriving (Show)
 
@@ -68,7 +74,7 @@ initialEnv = do
   masterOffset <- newTVarIO 0
   xReadBlockSem <- newEmptyMVar
   xReadBlockOptions <- newEmptyMVar
-  multiTransactionActive <- newTVarIO False
+  multiTransactions <- newTVarIO Map.empty
   pure
     RedisEnv
       { dataStore
@@ -85,7 +91,7 @@ initialEnv = do
       , masterOffset
       , xReadBlockSem
       , xReadBlockOptions
-      , multiTransactionActive
+      , multiTransactions
       }
   where
     createDataStore :: Options -> IO (IORef DataStore)

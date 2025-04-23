@@ -124,7 +124,7 @@ runReplica (s, addr) = do
     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
     >-> P.tee
       ( P.map snd
-          >-> P.wither (\cmd -> fmap (cmd,) <$> runCommand (s, addr) cmd)
+          >-> P.wither (\cmd -> fmap (cmd,) <$> runOrQueueCommand (s, addr) cmd)
           >-> P.filter (isReplConfGetAckCommand . fst)
           >-> P.map snd
           >-> P.map (TE.encodeUtf8 . showt)
