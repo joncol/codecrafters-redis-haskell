@@ -601,5 +601,7 @@ runExecCommand = do
   env <- ask
   multiTransactionActive <- liftIO $ readTVarIO env.multiTransactionActive
   if multiTransactionActive
-    then error "not implemented"
+    then do
+      liftIO . atomically $ writeTVar env.multiTransactionActive False
+      pure $ Array []
     else pure $ SimpleError "ERR EXEC without MULTI"
