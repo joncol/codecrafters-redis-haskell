@@ -75,6 +75,7 @@ data Command
   | XRead (Either RespType XReadOptions)
   | Incr Text
   | Multi
+  | Exec
   deriving (Show)
   deriving (TextShow) via FromStringShow Command
 
@@ -103,6 +104,7 @@ isReplicatedCommand (XRange {}) = False
 isReplicatedCommand (XRead _) = False
 isReplicatedCommand (Incr _) = True
 isReplicatedCommand Multi = False
+isReplicatedCommand Exec = False
 
 commandFromArray :: RespType -> Maybe Command
 commandFromArray (Array (BulkString cmd : args))
@@ -146,7 +148,8 @@ commandFromArray (Array (BulkString cmd : args))
   | cmd ~= "incr"
   , BulkString key : _ <- args =
       Just $ Incr key
-  | cmd ~= "multi" = Just $ Multi
+  | cmd ~= "multi" = Just Multi
+  | cmd ~= "exec" = Just Exec
   | otherwise = Nothing
 commandFromArray _ = Nothing
 
@@ -205,6 +208,7 @@ runCommand (socket, addr) command = do
       Right streamParams -> Just <$> runXReadCommand streamParams
     Incr key -> Just <$> runIncrCommand key
     Multi -> Just <$> runMultiCommand
+    Exec -> Just <$> runExecCommand
 
 runSetCommand :: MonadIO m => Text -> Text -> SetOptions -> RedisM m RespType
 runSetCommand key val options = do
@@ -587,4 +591,15 @@ runIncrCommand key =
     _ -> pure $ SimpleError "ERR value is not an integer or out of range"
 
 runMultiCommand :: MonadIO m => RedisM m RespType
-runMultiCommand = pure ok
+runMultiCommand = do
+  env <- ask
+  liftIO . atomically $ writeTVar env.multiTransactionActive True
+  pure ok
+
+runExecCommand :: MonadIO m => RedisM m RespType
+runExecCommand = do
+  env <- ask
+  multiTransactionActive <- liftIO $ readTVarIO env.multiTransactionActive
+  if multiTransactionActive
+    then error "not implemented"
+    else pure $ SimpleError "ERR EXEC without MULTI"
