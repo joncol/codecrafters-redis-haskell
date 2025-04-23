@@ -32,6 +32,7 @@ import Control.Monad.Trans.Maybe (runMaybeT)
 import Data.Attoparsec.ByteString (parseOnly)
 import Data.ByteString.Char8 qualified as BS8
 import Data.Foldable (toList)
+import Data.Functor (($>))
 import Data.IORef
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -574,5 +575,9 @@ runXReadCommand options
 runIncrCommand :: MonadIO m => Text -> RedisM m RespType
 runIncrCommand key =
   runGetCommand key >>= \case
-    BulkString s | Just n <- readMaybe (T.unpack s) -> pure . Integer $ n + 1
+    NullBulkString -> runSetCommand key "1" defaultSetOptions $> Integer 1
+    BulkString s | Just n <- readMaybe (T.unpack s) -> do
+      let n' = n + 1
+      void $ runSetCommand key (showt n') defaultSetOptions
+      pure $ Integer n'
     _ -> error "not implemented"
