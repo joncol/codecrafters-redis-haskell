@@ -11,7 +11,11 @@
 {-# OPTIONS_GHC -Wall #-}
 
 module Command
-  ( Command (..)
+  ( RedisEnv (..)
+  , initialEnv
+  , ReplicaInfo (..)
+  , TransactionInfo (..)
+  , Command (..)
   , isPsyncCommand
   , isReplConfGetAckCommand
   , isReplicatedCommand
@@ -21,7 +25,6 @@ module Command
   , isTransactionActive
   ) where
 
-import Control.Applicative ((<|>))
 import Control.Arrow ((>>>))
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
@@ -32,13 +35,14 @@ import Control.Monad.Reader
 import Control.Monad.Trans.Maybe (runMaybeT)
 import Data.Attoparsec.ByteString (parseOnly)
 import Data.ByteString.Char8 qualified as BS8
+import Data.ByteString.Lazy qualified as LBS
 import Data.Foldable (toList)
 import Data.Functor (($>))
 import Data.IORef
-import Data.Map.Strict (Map)
+import Data.Map.Strict (Map, (!))
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, fromJust, fromMaybe)
-import Data.Sequence (Seq ((:|>)))
+import Data.Maybe
+import Data.Sequence (Seq ((:|>)), (|>))
 import Data.Sequence qualified as Seq
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -48,16 +52,103 @@ import Data.Time.Clock.POSIX
 import Data.Word (Word64)
 import Network.Socket (SockAddr, Socket, getPeerName)
 import Network.Socket.ByteString (sendAll)
+import System.IO.Error
+import Text.Megaparsec hiding (Stream)
 import Text.Read (readMaybe)
 import TextShow
 
 import CommandOptions
+import DataStore
 import Options
-import RedisEnv
+import RdbParser
 import RedisM
 import RespType
 import Stream
 import Util
+
+data RedisEnv = RedisEnv
+  { dataStore :: IORef DataStore
+  , streams :: TVar (Map StreamKey (Seq Stream))
+  , options :: Options
+  , isMasterNode :: Bool
+  , mReplicationId :: Maybe Text
+  -- ^ Replication ID for master nodes.
+  , replicas :: TVar (Map SockAddr ReplicaInfo)
+  -- ^ If we're the master node, this keeps track of all connected replicas.
+  -- TODO: Should we use something more STM-friendly like
+  -- http://hackage.haskell.org/package/tskiplist instead?
+  , replicaOffset :: IORef Int
+  -- ^ Number of command bytes sent from the master node. Only used by replicas.
+  , masterOffset :: TVar Int
+  -- ^ Number of command bytes sent from the master node. Only used by masters.
+  , xReadBlockSem :: MVar ()
+  , xReadBlockOptions :: MVar XReadOptions
+  , transactions :: TVar (Map SockAddr TransactionInfo)
+  }
+
+data ReplicaInfo = ReplicaInfo
+  { socket :: Socket
+  , lastKnownReplicaOffset :: Int
+  }
+  deriving (Show)
+
+data TransactionInfo = TransactionInfo
+  { active :: Bool
+  , queue :: Seq Command
+  }
+  deriving (Show)
+
+initialEnv :: IO RedisEnv
+initialEnv = do
+  options <- parseOptions
+  dataStore <- createDataStore options
+  streams <- newTVarIO Map.empty
+  let isMasterNode = isNothing options.mReplicaOf
+  replicas <- newTVarIO Map.empty
+  replicaOffset <- newIORef 0
+  masterOffset <- newTVarIO 0
+  xReadBlockSem <- newEmptyMVar
+  xReadBlockOptions <- newEmptyMVar
+  transactions <- newTVarIO Map.empty
+  pure
+    RedisEnv
+      { dataStore
+      , streams
+      , options
+      , isMasterNode
+      , -- Only set replication ID for master nodes.
+        mReplicationId =
+          if isMasterNode
+            then Just "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
+            else Nothing
+      , replicas
+      , replicaOffset
+      , masterOffset
+      , xReadBlockSem
+      , xReadBlockOptions
+      , transactions
+      }
+  where
+    createDataStore :: Options -> IO (IORef DataStore)
+    createDataStore options = do
+      ds <- case rdbFilename options of
+        Nothing -> pure Map.empty
+        Just fn ->
+          flip
+            catchIOError
+            ( \e ->
+                if isDoesNotExistError e
+                  then do
+                    putStrLn "warning: RDB file does not exist"
+                    pure Map.empty
+                  else ioError e
+            )
+            $ do
+              rdbContents <- LBS.readFile fn
+              case parseMaybe RdbParser.rdb rdbContents of
+                Just rdb' -> pure . Map.fromList $ concat rdb'.databases
+                Nothing -> error "error: invalid RDB file"
+      newIORef ds
 
 data Command
   = Ping
@@ -156,7 +247,7 @@ commandFromArray _ = Nothing
 
 -- | Replace all occurrences of 'OnlyNewEntries' in 'options' with the latest
 -- stream ID for the relevant stream key.
-fixupXReadOptions :: MonadIO m => Command -> RedisM m Command
+fixupXReadOptions :: MonadIO m => Command -> RedisM RedisEnv m Command
 fixupXReadOptions (XRead (Right options)) = do
   fixedBounds <- forM (options.streamKeys `zip` options.streamIdBounds) $
     \(streamKey, bound) ->
@@ -166,7 +257,7 @@ fixupXReadOptions (XRead (Right options)) = do
   pure $ XRead (Right options {streamIdBounds = fixedBounds})
 fixupXReadOptions command = pure command
 
-lastStreamId :: MonadIO m => StreamKey -> RedisM m StreamId
+lastStreamId :: MonadIO m => StreamKey -> RedisM RedisEnv m StreamId
 lastStreamId streamKey = do
   env <- ask
   allStreams <- liftIO $ readTVarIO env.streams
@@ -184,7 +275,7 @@ runOrQueueCommand
   :: MonadIO m
   => (Socket, SockAddr)
   -> Command
-  -> RedisM m (Maybe RespType)
+  -> RedisM RedisEnv m (Maybe RespType)
 runOrQueueCommand (socket, addr) command = do
   peerName <- liftIO $ getPeerName socket
   txActive <- isTransactionActive peerName
@@ -193,16 +284,24 @@ runOrQueueCommand (socket, addr) command = do
 
   if not txActive || isExecCommand
     then runCommand (socket, addr) command
-    else Just <$> queueCommand command
+    else Just <$> queueCommand (socket, addr) command
+
+-- | Helper function that gets the transaction info (if any) for a given
+-- 'peerName'.
+getTransactionInfo
+  :: MonadIO m
+  => SockAddr
+  -> RedisM RedisEnv m (Maybe TransactionInfo)
+getTransactionInfo peerName = do
+  env <- ask
+  transactions <- liftIO $ readTVarIO env.transactions
+  pure $ Map.lookup peerName transactions
 
 -- | Helper function that checks if there's an active transaction for a given
 -- 'peerName'.
-isTransactionActive :: MonadIO m => SockAddr -> RedisM m Bool
+isTransactionActive :: MonadIO m => SockAddr -> RedisM RedisEnv m Bool
 isTransactionActive peerName = do
-  env <- ask
-  multiTransactions <- liftIO $ readTVarIO env.multiTransactions
-  let mTransactionInfo = Map.lookup peerName multiTransactions
-  case mTransactionInfo of
+  getTransactionInfo peerName >>= \case
     Just transactionInfo -> pure transactionInfo.active
     Nothing -> pure False
 
@@ -210,8 +309,9 @@ runCommand
   :: MonadIO m
   => (Socket, SockAddr)
   -> Command
-  -> RedisM m (Maybe RespType)
+  -> RedisM RedisEnv m (Maybe RespType)
 runCommand (socket, addr) command = do
+  liftIO . putStrLn $ "runCommand, command: " <> show command
   case command of
     Ping -> pure . Just $ SimpleString "PONG"
     Echo s -> pure . Just $ BulkString s
@@ -237,11 +337,27 @@ runCommand (socket, addr) command = do
     Multi -> Just <$> runMultiCommand (socket, addr)
     Exec -> Just <$> runExecCommand (socket, addr)
 
-queueCommand :: MonadIO m => Command -> RedisM m RespType
-queueCommand _command = do
-  pure $ SimpleString "QUEUED"
+queueCommand
+  :: MonadIO m
+  => (Socket, SockAddr)
+  -> Command
+  -> RedisM RedisEnv m RespType
+queueCommand (socket, _addr) command = do
+  env <- ask
+  peerName <- liftIO $ getPeerName socket
+  getTransactionInfo peerName >>= \case
+    Just transactionInfo | True <- transactionInfo.active -> do
+      liftIO . atomically . modifyTVar' env.transactions $
+        Map.adjust (\tx -> tx {queue = tx.queue |> command}) peerName
+      pure $ SimpleString "QUEUED"
+    _ -> error "impossible"
 
-runSetCommand :: MonadIO m => Text -> Text -> SetOptions -> RedisM m RespType
+runSetCommand
+  :: MonadIO m
+  => Text
+  -> Text
+  -> SetOptions
+  -> RedisM RedisEnv m RespType
 runSetCommand key val options = do
   mExpirationTime <- case options.px of
     Just px -> do
@@ -263,14 +379,14 @@ runSetCommand key val options = do
         , mExpirationTime
         }
 
-runGetCommand :: MonadIO m => Text -> RedisM m RespType
+runGetCommand :: MonadIO m => Text -> RedisM RedisEnv m RespType
 runGetCommand key = do
   expired <- isKeyExpired key
   if expired
     then pure NullBulkString
     else getValue key
 
-getValue :: MonadIO m => Text -> RedisM m RespType
+getValue :: MonadIO m => Text -> RedisM RedisEnv m RespType
 getValue key = do
   dataStoreRef <- asks dataStore
   dataStore <- liftIO $ readIORef dataStoreRef
@@ -279,7 +395,7 @@ getValue key = do
       pure $ BulkString value
     Nothing -> pure NullBulkString
 
-runConfigGetCommand :: MonadIO m => Text -> RedisM m RespType
+runConfigGetCommand :: MonadIO m => Text -> RedisM RedisEnv m RespType
 runConfigGetCommand configName =
   do
     configVal <-
@@ -289,7 +405,7 @@ runConfigGetCommand configName =
         )
     pure $ Array [BulkString configName, configVal]
 
-runKeysCommand :: MonadIO m => Text -> RedisM m RespType
+runKeysCommand :: MonadIO m => Text -> RedisM RedisEnv m RespType
 runKeysCommand _pat = do
   dataStoreRef <- asks dataStore
   dataStore <- liftIO $ readIORef dataStoreRef
@@ -303,7 +419,7 @@ runKeysCommand _pat = do
       )
       (Map.keys dataStore)
 
-isKeyExpired :: MonadIO m => Text -> RedisM m Bool
+isKeyExpired :: MonadIO m => Text -> RedisM RedisEnv m Bool
 isKeyExpired key = do
   dataStoreRef <- asks dataStore
   dataStore <- liftIO $ readIORef dataStoreRef
@@ -317,7 +433,7 @@ isKeyExpired key = do
         Nothing -> pure False
     Nothing -> pure False
 
-runInfoCommand :: MonadIO m => Text -> RedisM m RespType
+runInfoCommand :: MonadIO m => Text -> RedisM RedisEnv m RespType
 runInfoCommand section
   | section ~= "replication" = do
       options <- asks options
@@ -342,7 +458,7 @@ runReplConfCommand
   => (Socket, SockAddr)
   -> Text
   -> Text
-  -> RedisM m (Maybe RespType)
+  -> RedisM RedisEnv m (Maybe RespType)
 runReplConfCommand (socket, _addr) key val
   | key ~= "listening-port" = pure . Just $ ok
   | key ~= "capa" = pure . Just $ ok
@@ -380,12 +496,12 @@ runReplConfCommand (socket, _addr) key val
       pure Nothing
   | otherwise = error $ "unknown REPLCONF key: " <> show key
 
-runPsyncCommand :: MonadIO m => Text -> Text -> RedisM m RespType
+runPsyncCommand :: MonadIO m => Text -> Text -> RedisM RedisEnv m RespType
 runPsyncCommand _replicationId _offset = do
   replId <- asks $ fromMaybe "not available for replicas" . mReplicationId
   pure . SimpleString $ T.unwords ["FULLRESYNC", replId, "0"]
 
-runWaitCommand :: MonadIO m => Int -> Int -> RedisM m RespType
+runWaitCommand :: MonadIO m => Int -> Int -> RedisM RedisEnv m RespType
 runWaitCommand numReplicas timeout = do
   env <- ask
   masterOffset <- liftIO $ readTVarIO env.masterOffset
@@ -414,8 +530,8 @@ runWaitCommand numReplicas timeout = do
                   pure $ Integer n
               )
                 <|> Integer
-                  <$> caughtUpReplicaCount env masterOffset
-                  <* (readTVar timeouted >>= check)
+                <$> caughtUpReplicaCount env masterOffset
+                <* (readTVar timeouted >>= check)
 
         -- Increment `masterOffset` due to the REPLCONF GETACK just sent.
         liftIO . atomically $ do
@@ -432,7 +548,7 @@ runWaitCommand numReplicas timeout = do
           (\r -> masterOffset <= r.lastKnownReplicaOffset)
           replicas
 
-runTypeCommand :: MonadIO m => Text -> RedisM m RespType
+runTypeCommand :: MonadIO m => Text -> RedisM RedisEnv m RespType
 runTypeCommand key = do
   env <- ask
   dataStore <- liftIO $ readIORef env.dataStore
@@ -448,7 +564,7 @@ runXAddCommand
   => StreamKey
   -> StreamIdRequest
   -> [(Text, Text)]
-  -> RedisM m RespType
+  -> RedisM RedisEnv m RespType
 runXAddCommand streamKey streamIdReq entries = do
   -- TODO: Generalize error handling so that all command handlers can
   -- `throwError`.
@@ -489,7 +605,7 @@ runXAddCommand streamKey streamIdReq entries = do
       -> Maybe (Seq Stream)
       -> Int
       -> Maybe Word64
-      -> ExceptT RespType (RedisM m) RespType
+      -> ExceptT RespType (RedisM RedisEnv m) RespType
     addEntry streams mOldStream timePart mSequenceNumber = do
       let mOldStream' =
             Seq.filter (\str -> str.streamId.timePart == timePart)
@@ -525,7 +641,7 @@ runXRangeCommand
   :: MonadIO m
   => StreamKey
   -> (StreamId, StreamId)
-  -> RedisM m RespType
+  -> RedisM RedisEnv m RespType
 runXRangeCommand key (start, end) = do
   env <- ask
   allStreams <- liftIO $ readTVarIO env.streams
@@ -539,7 +655,7 @@ runXRangeCommand key (start, end) = do
         $ Seq.dropWhileR (\s -> end < s.streamId) strs
     Nothing -> pure $ Array []
 
-runXReadCommand :: MonadIO m => XReadOptions -> RedisM m RespType
+runXReadCommand :: MonadIO m => XReadOptions -> RedisM RedisEnv m RespType
 runXReadCommand options
   | Nothing <- options.blockTimeout =
       liftIO . atomically . fmap (fromMaybe NullBulkString) . getResult =<< ask
@@ -583,7 +699,7 @@ runXReadCommand options
           _ -> fail "unexpected error"
       pure $ Array result
 
-runIncrCommand :: MonadIO m => Text -> RedisM m RespType
+runIncrCommand :: MonadIO m => Text -> RedisM RedisEnv m RespType
 runIncrCommand key =
   runGetCommand key >>= \case
     NullBulkString -> runSetCommand key "1" defaultSetOptions $> Integer 1
@@ -593,24 +709,30 @@ runIncrCommand key =
       pure $ Integer n'
     _ -> pure $ SimpleError "ERR value is not an integer or out of range"
 
-runMultiCommand :: MonadIO m => (Socket, SockAddr) -> RedisM m RespType
+runMultiCommand :: MonadIO m => (Socket, SockAddr) -> RedisM RedisEnv m RespType
 runMultiCommand (socket, _addr) = do
   env <- ask
   peerName <- liftIO $ getPeerName socket
-  liftIO . atomically . modifyTVar' env.multiTransactions $
-    Map.insert peerName TransactionInfo {active = True}
-  liftIO $ putStrLn "starting MULTI transaction"
+  liftIO . atomically . modifyTVar' env.transactions $
+    Map.insert peerName TransactionInfo {active = True, queue = Seq.empty}
   pure ok
 
-runExecCommand :: MonadIO m => (Socket, SockAddr) -> RedisM m RespType
-runExecCommand (socket, _addr) = do
+runExecCommand :: MonadIO m => (Socket, SockAddr) -> RedisM RedisEnv m RespType
+runExecCommand (socket, addr) = do
   env <- ask
   peerName <- liftIO $ getPeerName socket
   txActive <- isTransactionActive peerName
   if txActive
     then do
-      liftIO . atomically . modifyTVar' env.multiTransactions $
-        Map.insert peerName TransactionInfo {active = False}
-      liftIO $ putStrLn "finishing MULTI transaction, due to EXEC"
-      pure $ Array []
+      queue <- liftIO . atomically $ do
+        transactions <- readTVar env.transactions
+        modifyTVar' env.transactions $
+          Map.insert
+            peerName
+            TransactionInfo
+              { active = False
+              , queue = Seq.empty
+              }
+        pure $ toList (transactions ! peerName).queue
+      Array . catMaybes <$> forM queue (runCommand (socket, addr))
     else pure $ SimpleError "ERR EXEC without MULTI"

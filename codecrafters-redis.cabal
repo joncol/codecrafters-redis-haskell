@@ -17,7 +17,6 @@ executable codecrafters-redis-exe
       DataStore
       Options
       RdbParser
-      RedisEnv
       RedisM
       Replica
       RespParser

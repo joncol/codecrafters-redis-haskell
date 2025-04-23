@@ -28,7 +28,6 @@ import TextShow
 
 import Command
 import Options
-import RedisEnv
 import RedisM
 import RespParser
 import RespType
@@ -118,7 +117,7 @@ handshake s listeningPort = do
 runReplica
   :: MonadIO m
   => (Socket, SockAddr)
-  -> Effect (RedisM m) ()
+  -> Effect (RedisM RedisEnv m) ()
 runReplica (s, addr) = do
   void (A.parsed parseCommand (fromSocket s bufferSize))
     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)

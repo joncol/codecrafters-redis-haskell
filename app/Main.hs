@@ -15,10 +15,10 @@ import Pipes.Network.TCP
 import System.IO
 
 import Options
-import RedisEnv
 import RedisM
 import Replica
 import Server
+import Command
 
 main :: IO ()
 main = do

@@ -1,5 +1,4 @@
 {-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -28,12 +27,11 @@ import Pipes.Prelude qualified as P
 import TextShow
 
 import Command
-import RedisEnv
 import RedisM
 import RespParser
 import RespType
 
-runServer :: MonadIO m => (Socket, SockAddr) -> Effect (RedisM m) ()
+runServer :: MonadIO m => (Socket, SockAddr) -> Effect (RedisM RedisEnv m) ()
 runServer (socket, addr) = do
   env <- ask
   void (A.parsed parseCommand $ fromSocket socket bufferSize)
@@ -91,7 +89,7 @@ propagateCommandToReplicas
   :: MonadIO m
   => (Socket, SockAddr)
   -> RespType
-  -> RedisM m ()
+  -> RedisM RedisEnv m ()
 propagateCommandToReplicas (socket, _addr) cmdArray = do
   env <- ask
 

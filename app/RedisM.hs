@@ -9,16 +9,14 @@ where
 
 import Control.Monad.Reader
 
-import RedisEnv
-
-newtype RedisM m a = RedisM
-  { runRedisM :: ReaderT RedisEnv m a
+newtype RedisM r m a = RedisM
+  { runRedisM :: ReaderT r m a
   }
   deriving
     ( Functor
     , Applicative
     , Monad
-    , MonadReader RedisEnv
+    , MonadReader r
     , MonadIO
     )
 
