@@ -74,6 +74,7 @@ data Command
   | XRange StreamKey (StreamId, StreamId)
   | XRead (Either RespType XReadOptions)
   | Incr Text
+  | Multi
   deriving (Show)
   deriving (TextShow) via FromStringShow Command
 
@@ -101,6 +102,7 @@ isReplicatedCommand (XAdd {}) = True
 isReplicatedCommand (XRange {}) = False
 isReplicatedCommand (XRead _) = False
 isReplicatedCommand (Incr _) = True
+isReplicatedCommand Multi = False
 
 commandFromArray :: RespType -> Maybe Command
 commandFromArray (Array (BulkString cmd : args))
@@ -144,6 +146,7 @@ commandFromArray (Array (BulkString cmd : args))
   | cmd ~= "incr"
   , BulkString key : _ <- args =
       Just $ Incr key
+  | cmd ~= "multi" = Just $ Multi
   | otherwise = Nothing
 commandFromArray _ = Nothing
 
@@ -201,6 +204,7 @@ runCommand (socket, addr) command = do
       Left err -> pure $ Just err
       Right streamParams -> Just <$> runXReadCommand streamParams
     Incr key -> Just <$> runIncrCommand key
+    Multi -> Just <$> runMultiCommand
 
 runSetCommand :: MonadIO m => Text -> Text -> SetOptions -> RedisM m RespType
 runSetCommand key val options = do
@@ -581,3 +585,6 @@ runIncrCommand key =
       void $ runSetCommand key (showt n') defaultSetOptions
       pure $ Integer n'
     _ -> pure $ SimpleError "ERR value is not an integer or out of range"
+
+runMultiCommand :: MonadIO m => RedisM m RespType
+runMultiCommand = pure ok
