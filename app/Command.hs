@@ -263,18 +263,18 @@ pairs (x : y : rest) = (x, y) : pairs rest
 
 runOrQueueCommand
   :: MonadIO m
-  => (Socket, SockAddr)
+  => Socket
   -> Command
   -> RedisM RedisEnv m (Maybe RespType)
-runOrQueueCommand (socket, addr) command = do
+runOrQueueCommand socket command = do
   peerName <- liftIO $ getPeerName socket
   txActive <- isTransactionActive peerName
 
   let isExecCommand = case command of Exec -> True; _ -> False
 
   if not txActive || isExecCommand
-    then runCommand (socket, addr) command
-    else Just <$> queueCommand (socket, addr) command
+    then runCommand socket command
+    else Just <$> queueCommand socket command
 
 -- | Helper function that gets the transaction info (if any) for a given
 -- 'peerName'.
@@ -297,10 +297,10 @@ isTransactionActive peerName = do
 
 runCommand
   :: MonadIO m
-  => (Socket, SockAddr)
+  => Socket
   -> Command
   -> RedisM RedisEnv m (Maybe RespType)
-runCommand (socket, addr) command = do
+runCommand socket command = do
   liftIO . putStrLn $ "runCommand, command: " <> show command
   case command of
     Ping -> pure . Just $ SimpleString "PONG"
@@ -310,7 +310,7 @@ runCommand (socket, addr) command = do
     ConfigGet configName -> Just <$> runConfigGetCommand configName
     Keys pat -> Just <$> runKeysCommand pat
     Info section -> Just <$> runInfoCommand section
-    ReplConf key val -> runReplConfCommand (socket, addr) key val
+    ReplConf key val -> runReplConfCommand socket key val
     Psync replicationId offset ->
       Just <$> runPsyncCommand replicationId offset
     Wait numReplicas timeout ->
@@ -324,15 +324,15 @@ runCommand (socket, addr) command = do
       Left err -> pure $ Just err
       Right streamParams -> Just <$> runXReadCommand streamParams
     Incr key -> Just <$> runIncrCommand key
-    Multi -> Just <$> runMultiCommand (socket, addr)
-    Exec -> Just <$> runExecCommand (socket, addr)
+    Multi -> Just <$> runMultiCommand socket
+    Exec -> Just <$> runExecCommand socket
 
 queueCommand
   :: MonadIO m
-  => (Socket, SockAddr)
+  => Socket
   -> Command
   -> RedisM RedisEnv m RespType
-queueCommand (socket, _addr) command = do
+queueCommand socket command = do
   env <- ask
   peerName <- liftIO $ getPeerName socket
   getTransactionInfo peerName >>= \case
@@ -445,11 +445,11 @@ runInfoCommand section
 
 runReplConfCommand
   :: MonadIO m
-  => (Socket, SockAddr)
+  => Socket
   -> Text
   -> Text
   -> RedisM RedisEnv m (Maybe RespType)
-runReplConfCommand (socket, _addr) key val
+runReplConfCommand socket key val
   | key ~= "listening-port" = pure . Just $ ok
   | key ~= "capa" = pure . Just $ ok
   | key ~= "getack" && val == "*" = do
@@ -699,16 +699,16 @@ runIncrCommand key =
       pure $ Integer n'
     _ -> pure $ SimpleError "ERR value is not an integer or out of range"
 
-runMultiCommand :: MonadIO m => (Socket, SockAddr) -> RedisM RedisEnv m RespType
-runMultiCommand (socket, _addr) = do
+runMultiCommand :: MonadIO m => Socket -> RedisM RedisEnv m RespType
+runMultiCommand socket = do
   env <- ask
   peerName <- liftIO $ getPeerName socket
   liftIO . atomically . modifyTVar' env.transactions $
     Map.insert peerName TransactionInfo {active = True, queue = Seq.empty}
   pure ok
 
-runExecCommand :: MonadIO m => (Socket, SockAddr) -> RedisM RedisEnv m RespType
-runExecCommand (socket, addr) = do
+runExecCommand :: MonadIO m => Socket -> RedisM RedisEnv m RespType
+runExecCommand socket = do
   env <- ask
   peerName <- liftIO $ getPeerName socket
   txActive <- isTransactionActive peerName
@@ -724,5 +724,5 @@ runExecCommand (socket, addr) = do
               , queue = Seq.empty
               }
         pure $ toList (transactions ! peerName).queue
-      Array . catMaybes <$> forM queue (runCommand (socket, addr))
+      Array . catMaybes <$> forM queue (runCommand socket)
     else pure $ SimpleError "ERR EXEC without MULTI"

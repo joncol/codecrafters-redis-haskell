@@ -30,4 +30,4 @@ main = do
 
   serve HostAny port' $ \(s, addr) -> do
     putStrLn $ "successfully connected client: " ++ show addr
-    flip runReaderT redisEnv . runRedisM . runEffect $ runServer (s, addr)
+    flip runReaderT redisEnv . runRedisM . runEffect $ runServer s

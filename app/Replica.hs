@@ -42,15 +42,13 @@ initReplica redisEnv
 
       -- Using `forkIO` here, since the socket should be long lived.
       void . forkIO . connect (T.unpack masterHostName) (T.unpack masterPort) $
-        \(s, addr) -> do
+        \(s, _addr) -> do
           handshake s redisEnv.options.port
 
           putMVar handshakeComplete ()
 
           -- Set up the replica streaming pipeline.
-          void $
-            flip runReaderT redisEnv . runRedisM . runEffect $
-              runReplica (s, addr)
+          void $ flip runReaderT redisEnv . runRedisM . runEffect $ runReplica s
 
           putStrLn "closing replica socket"
 
@@ -105,16 +103,13 @@ handshake s listeningPort = do
         , BulkString "-1"
         ]
 
-runReplica
-  :: MonadIO m
-  => (Socket, SockAddr)
-  -> Effect (RedisM RedisEnv m) ()
-runReplica (s, addr) = do
+runReplica :: MonadIO m => Socket -> Effect (RedisM RedisEnv m) ()
+runReplica s = do
   void (A.parsed parseCommand (fromSocket s bufferSize))
     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
     >-> P.tee
       ( P.map snd
-          >-> P.wither (\cmd -> fmap (cmd,) <$> runOrQueueCommand (s, addr) cmd)
+          >-> P.wither (\cmd -> fmap (cmd,) <$> runOrQueueCommand s cmd)
           >-> P.filter (isReplConfGetAckCommand . fst)
           >-> P.map snd
           >-> P.map (TE.encodeUtf8 . showt)

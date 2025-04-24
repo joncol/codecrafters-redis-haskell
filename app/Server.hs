@@ -24,15 +24,15 @@ import RedisM
 import RespParser
 import RespType
 
-runServer :: MonadIO m => (Socket, SockAddr) -> Effect (RedisM RedisEnv m) ()
-runServer (socket, addr) = do
+runServer :: MonadIO m => Socket -> Effect (RedisM RedisEnv m) ()
+runServer socket = do
   env <- ask
   void (A.parsed parseCommand $ fromSocket socket bufferSize)
     >-> P.mapMaybe (\cmdArray -> (cmdArray,) <$> commandFromArray cmdArray)
     >-> P.mapM (\(cmdArray, cmd) -> (cmdArray,) <$> fixupXReadOptions cmd)
     >-> P.wither
       ( \(cmdArray, cmd) ->
-          fmap ((cmdArray, cmd),) <$> runOrQueueCommand (socket, addr) cmd
+          fmap ((cmdArray, cmd),) <$> runOrQueueCommand socket cmd
       )
     >-> P.tee
       ( P.map snd -- throw away the commands and only keep the results
@@ -47,13 +47,13 @@ runServer (socket, addr) = do
                 -- PSYNC command has been sent (in `toSocket` above), otherwise
                 -- the RDB data would be placed before the "+FULLRESYNC" result.
                 sendRdbDataToReplica socket
-                saveReplicaConnection (socket, addr) env
+                saveReplicaConnection socket env
             )
       )
     >-> P.filter (\((_cmdArray, cmd), _res) -> isReplicatedCommand cmd)
     >-> P.mapM_
       ( \((cmdArray, _cmd), _res) ->
-          propagateCommandToReplicas (socket, addr) cmdArray
+          propagateCommandToReplicas socket cmdArray
       )
   where
     parseCommand = A.choice [psyncResponse, rdbData, array]
@@ -63,8 +63,8 @@ sendRdbDataToReplica socket = do
   let rdb = BS8.pack ("$" <> show (length emptyRdb) <> crlf) <> BS.pack emptyRdb
   liftIO $ sendAll socket rdb
 
-saveReplicaConnection :: MonadIO m => (Socket, SockAddr) -> RedisEnv -> m ()
-saveReplicaConnection (socket, _addr) redisEnv = do
+saveReplicaConnection :: MonadIO m => Socket -> RedisEnv -> m ()
+saveReplicaConnection socket redisEnv = do
   liftIO $ do
     peerName <- getPeerName socket
     -- TODO: Handle lost replica connections.
@@ -79,11 +79,8 @@ saveReplicaConnection (socket, _addr) redisEnv = do
         Map.insert peerName replicaInfo replicas
 
 propagateCommandToReplicas
-  :: MonadIO m
-  => (Socket, SockAddr)
-  -> RespType
-  -> RedisM RedisEnv m ()
-propagateCommandToReplicas (socket, _addr) cmdArray = do
+  :: MonadIO m => Socket -> RespType -> RedisM RedisEnv m ()
+propagateCommandToReplicas socket cmdArray = do
   env <- ask
 
   peerName <- liftIO $ getPeerName socket
