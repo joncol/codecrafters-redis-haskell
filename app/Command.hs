@@ -604,7 +604,7 @@ runXAddCommand streamKey streamIdReq entries = do
       let mOldStream' =
             Seq.filter (\str -> str.streamId.timePart == timePart)
               <$> mOldStream
-      let sequenceNumber =
+          sequenceNumber =
             fromMaybe
               ( case mOldStream' of
                   Just (_ :|> lastStream) ->
@@ -612,8 +612,9 @@ runXAddCommand streamKey streamIdReq entries = do
                   _ -> if timePart == 0 then 1 else 0
               )
               mSequenceNumber
-      let streamId = StreamId {timePart, sequenceNumber}
-      let newStream = Seq.singleton $ Stream {streamId, entries}
+          streamId = StreamId {timePart, sequenceNumber}
+          newStream = Seq.singleton $ Stream {streamId, entries}
+
       liftIO . atomically . modifyTVar' streams $
         Map.insertWith ins streamKey newStream
 
