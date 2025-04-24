@@ -82,9 +82,7 @@ propagateCommandToReplicas
   :: MonadIO m => Socket -> RespType -> RedisM RedisEnv m ()
 propagateCommandToReplicas socket cmdArray = do
   env <- ask
-
-  peerName <- liftIO $ getPeerName socket
-  txActive <- isTransactionActive peerName
+  txActive <- isTransactionActive socket
 
   when (env.isMasterNode && not txActive) $ do
     -- Increment `masterOffset`.

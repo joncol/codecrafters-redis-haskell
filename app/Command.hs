@@ -158,6 +158,7 @@ data Command
   | Incr Text
   | Multi
   | Exec
+  | Discard
   deriving (Show)
   deriving (TextShow) via FromStringShow Command
 
@@ -187,6 +188,7 @@ isReplicatedCommand (XRead _) = False
 isReplicatedCommand (Incr _) = True
 isReplicatedCommand Multi = False
 isReplicatedCommand Exec = False
+isReplicatedCommand Discard = False
 
 commandFromArray :: RespType -> Maybe Command
 commandFromArray (Array (BulkString cmd : args))
@@ -232,6 +234,7 @@ commandFromArray (Array (BulkString cmd : args))
       Just $ Incr key
   | cmd ~= "multi" = Just Multi
   | cmd ~= "exec" = Just Exec
+  | cmd ~= "discard" = Just Discard
   | otherwise = Nothing
 commandFromArray _ = Nothing
 
@@ -267,12 +270,11 @@ runOrQueueCommand
   -> Command
   -> RedisM RedisEnv m (Maybe RespType)
 runOrQueueCommand socket command = do
-  peerName <- liftIO $ getPeerName socket
-  txActive <- isTransactionActive peerName
+  txActive <- isTransactionActive socket
 
-  let isExecCommand = case command of Exec -> True; _ -> False
+  let isTxCommand = case command of Exec -> True; Discard -> True; _ -> False
 
-  if not txActive || isExecCommand
+  if not txActive || isTxCommand
     then runCommand socket command
     else Just <$> queueCommand socket command
 
@@ -288,9 +290,10 @@ getTransactionInfo peerName = do
   pure $ Map.lookup peerName transactions
 
 -- | Helper function that checks if there's an active transaction for a given
--- 'peerName'.
-isTransactionActive :: MonadIO m => SockAddr -> RedisM RedisEnv m Bool
-isTransactionActive peerName = do
+-- socket.
+isTransactionActive :: MonadIO m => Socket -> RedisM RedisEnv m Bool
+isTransactionActive socket = do
+  peerName <- liftIO $ getPeerName socket
   getTransactionInfo peerName >>= \case
     Just transactionInfo -> pure transactionInfo.active
     Nothing -> pure False
@@ -326,6 +329,7 @@ runCommand socket command = do
     Incr key -> Just <$> runIncrCommand key
     Multi -> Just <$> runMultiCommand socket
     Exec -> Just <$> runExecCommand socket
+    Discard -> Just <$> runDiscardCommand socket
 
 queueCommand
   :: MonadIO m
@@ -710,10 +714,10 @@ runMultiCommand socket = do
 runExecCommand :: MonadIO m => Socket -> RedisM RedisEnv m RespType
 runExecCommand socket = do
   env <- ask
-  peerName <- liftIO $ getPeerName socket
-  txActive <- isTransactionActive peerName
+  txActive <- isTransactionActive socket
   if txActive
     then do
+      peerName <- liftIO $ getPeerName socket
       queue <- liftIO . atomically $ do
         transactions <- readTVar env.transactions
         modifyTVar' env.transactions $
@@ -726,3 +730,14 @@ runExecCommand socket = do
         pure $ toList (transactions ! peerName).queue
       Array . catMaybes <$> forM queue (runCommand socket)
     else pure $ SimpleError "ERR EXEC without MULTI"
+
+runDiscardCommand :: MonadIO m => Socket -> RedisM RedisEnv m RespType
+runDiscardCommand socket = do
+  env <- ask
+  txActive <- isTransactionActive socket
+  if txActive
+    then do
+      peerName <- liftIO $ getPeerName socket
+      liftIO . atomically $ modifyTVar' env.transactions $ Map.delete peerName
+      pure ok
+    else pure $ SimpleError "ERR DISCARD without MULTI"
